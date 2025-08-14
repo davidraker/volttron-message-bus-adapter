@@ -26,5 +26,22 @@ import logging
 from datetime import timedelta
 from pydantic import BaseModel, computed_field, ConfigDict, Field, model_validator
 
+
+# TODO: What fields do these all need?
+# TODO: How do we populate them from the config dict?
+class MessageBusConfig(BaseModel):
+    model_config = ConfigDict(validate_assignment=True, populate_by_name=True)
+
+
+# TODO: MQTT and NATS configurations should be in their respective repos, but how do they get used/imported here?
+class MQTTConfig(MessageBusConfig):
+    model_config = ConfigDict(validate_assignment=True, populate_by_name=True)
+
+
+class NATSConfig(MessageBusConfig):
+    model_config = ConfigDict(validate_assignment=True, populate_by_name=True)
+
+
 class MessageBusAdapterConfig(BaseModel):
     model_config = ConfigDict(validate_assignment=True, populate_by_name=True)
+    adapters = Field(default_factory=list[MessageBusConfig], description="List of bus adapter configurations.")
