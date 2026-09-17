@@ -35,7 +35,7 @@ from volttron.client.messaging.health import STATUS_BAD
 from volttron.client.vip.agent import RPC
 from volttron.utils import load_config, vip_main
 
-from presentation.resource import ResourceData
+from interoperability.resource import ResourceData
 
 from protocol_proxy.ipc import callback, ProtocolHeaders, ProtocolProxyMessage, ProtocolProxyPeer
 from protocol_proxy.manager.gevent import GeventProtocolProxyManager
