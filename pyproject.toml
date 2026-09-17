@@ -40,7 +40,7 @@ readme = "README.md"
 repository = "https://github.com/eclipse-volttron/volttron-message-bus-adapter"
 homepage = "https://github.com/eclipse-volttron/volttron-message-bus-adapter"
 keywords = []
-packages = [ { include = "protocol_proxy", from = "src" } ]
+packages = [ { include = "bus_adapter", from = "src" } ]
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "Intended Audience :: Science/Research",
@@ -52,7 +52,7 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = ">=3.10,<4.0"
-volttron-core = ">=2.0.0rc0"
+volttron-core = ">=2.0.0rc30"
 protocol-proxy = ">=2.0.0rc0"
 
 [tool.poetry.group.dev.dependencies]
@@ -67,6 +67,9 @@ isort = "^5.10.1"
 [tool.poetry.group.documentation.dependencies]
 Sphinx = "^4.5.0"
 sphinx-rtd-theme = "^1.0.0"
+
+[tool.poetry.scripts]
+volttron-message-bus-adapter = "bus_adapter.agent:main"
 
 [tool.yapf]
 based_on_style = "pep8"
