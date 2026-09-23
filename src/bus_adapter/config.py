@@ -22,9 +22,9 @@
 # ===----------------------------------------------------------------------===
 # }}}
 
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, field_validator, model_validator
 
 
 class MessageBusConfig(BaseModel):
@@ -55,12 +55,20 @@ class MessageBusConfig(BaseModel):
 
 
 class MQTTConfig(MessageBusConfig):
-    """Parameters of protocol_proxy.protocol.mqtt.MQTTProxy."""
+    """Parameters of protocol_proxy.protocol.mqtt.MQTTProxy. Unset optional values are not sent."""
     host: str
     port: int = 1883
     keepalive: int = 60
     bind_address: str = ''
     bind_port: int = 0
+    client_id: str | None = None
+    username: str | None = None
+    password: str | None = None
+    tls: bool | None = None
+    protocol: Literal['MQTTv31', 'MQTTv311', 'MQTTv5'] | None = None
+    qos: Literal[0, 1, 2] | None = None
+    reconnect_min_delay: float | None = Field(default=None, gt=0)
+    reconnect_max_delay: float | None = Field(default=None, gt=0)
 
     def _identity(self) -> tuple:
         return self.host, self.port
@@ -69,10 +77,26 @@ class MQTTConfig(MessageBusConfig):
 class NATSConfig(MessageBusConfig):
     """Parameters of protocol_proxy.protocol.nats.NATSProxy.
 
-    Only a single server URL is supported because parameters travel to the proxy
-    process as command line strings.
+    ``servers`` is one URL or a list of URLs; it is sent to the proxy as a comma-separated string.
     """
-    servers: str
+    servers: str | list[str]
+    name: str | None = None
+    user: str | None = None
+    password: str | None = None
+    nats_token: str | None = None
+    connect_timeout: float | None = Field(default=None, gt=0)
+    max_reconnect_attempts: int | None = None
+    reconnect_time_wait: float | None = Field(default=None, gt=0)
+    tls: bool | None = None
+
+    @field_validator('servers')
+    @classmethod
+    def _join_servers(cls, value: str | list[str]) -> str:
+        urls = value.split(',') if isinstance(value, str) else value
+        urls = [u.strip() for u in urls if u and u.strip()]
+        if not urls:
+            raise ValueError('At least one NATS server URL is required.')
+        return ','.join(urls)
 
     def _identity(self) -> tuple:
         return (self.servers,)

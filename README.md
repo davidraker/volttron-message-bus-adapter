@@ -29,8 +29,13 @@ transformed before being republished on VOLTTRON, and vice versa.
 
 - `bus_type`: protocol plugin name. Resolved to `protocol_proxy.protocol.<bus_type>`.
 - `adapters`: one entry per remote bus. All fields except `name` are passed to the proxy
-  process as command line arguments, so they must match the proxy's parameters
-  (MQTT: `host`, `port`, `keepalive`, `bind_address`, `bind_port`; NATS: `servers`).
+  process as command line arguments, so they must match the proxy's parameters.
+  - MQTT: `host`, `port`, `keepalive`, `bind_address`, `bind_port`, `client_id`, `username`,
+    `password`, `tls`, `protocol` (`MQTTv31`/`MQTTv311`/`MQTTv5`), `qos`, `reconnect_min_delay`,
+    `reconnect_max_delay`.
+  - NATS: `servers` (URL or list of URLs), `name`, `user`, `password`, `nats_token`,
+    `connect_timeout`, `max_reconnect_attempts`, `reconnect_time_wait`, `tls`.
+  Optional fields left unset are not sent, so the proxy's own defaults apply.
 - `name`: optional handle. The remote's `unique_remote_id` is `[bus_type, name]` when
   set, otherwise `[bus_type, host, port]` for MQTT and `[bus_type, servers]` for NATS.
 - `proxy_registration_timeout`: seconds to wait for a newly launched proxy to register.

@@ -68,3 +68,24 @@ def test_existing_instances_are_accepted():
 def test_timeout_must_be_positive():
     with pytest.raises(ValidationError):
         MessageBusAdapterConfig(proxy_registration_timeout=0)
+
+
+def test_optional_proxy_fields_only_sent_when_set():
+    config = MessageBusAdapterConfig(bus_type='mqtt', adapters=[
+        {'host': 'h', 'username': 'u', 'password': 'p', 'tls': True, 'protocol': 'MQTTv5', 'qos': 1}])
+    kwargs = config.adapters[0].proxy_kwargs()
+    assert kwargs['username'] == 'u' and kwargs['tls'] is True and kwargs['protocol'] == 'MQTTv5' and kwargs['qos'] == 1
+    assert 'client_id' not in kwargs and 'reconnect_min_delay' not in kwargs
+    with pytest.raises(ValidationError):
+        MessageBusAdapterConfig(bus_type='mqtt', adapters=[{'host': 'h', 'protocol': 'MQTTv9'}])
+    with pytest.raises(ValidationError):
+        MessageBusAdapterConfig(bus_type='mqtt', adapters=[{'host': 'h', 'qos': 3}])
+
+
+def test_nats_servers_joined_for_command_line():
+    config = MessageBusAdapterConfig(bus_type='nats', adapters=[
+        {'servers': ['nats://a:4222', ' nats://b:4222 '], 'nats_token': 't'}])
+    assert config.adapters[0].proxy_kwargs() == {'servers': 'nats://a:4222,nats://b:4222', 'nats_token': 't'}
+    assert config.remote_ids() == [('nats', 'nats://a:4222,nats://b:4222')]
+    with pytest.raises(ValidationError):
+        MessageBusAdapterConfig(bus_type='nats', adapters=[{'servers': ''}])

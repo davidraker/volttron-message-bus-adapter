@@ -42,7 +42,7 @@ classifiers = [
 [tool.poetry.dependencies]
 python = ">=3.10,<4.0"
 volttron-core = ">=2.0.0rc30"
-protocol-proxy = ">=2.0.0rc1"
+protocol-proxy = ">=2.0.0rc2"
 pydantic = "^2.0"
 # TODO: interoperability-service (provides interoperability.resource) is not yet published.
 #  It must be installed alongside this agent, e.g. from ../interoperability_service.
