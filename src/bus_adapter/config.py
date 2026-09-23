@@ -22,44 +22,110 @@
 # ===----------------------------------------------------------------------===
 # }}}
 
-from pydantic import BaseModel,ConfigDict, Field, model_validator
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, model_validator
 
 
-# TODO: What fields do these all need?
-# TODO: How do we populate them from the config dict?
 class MessageBusConfig(BaseModel):
-    model_config = ConfigDict(validate_assignment=True, populate_by_name=True)
+    """Configuration for a single remote message bus connection.
+
+    Every field other than ``name`` is forwarded to the protocol proxy process as a
+    command line argument (``--field-name value``), so field names must match the
+    proxy class's constructor parameters. ``extra='allow'`` lets bus types without a
+    dedicated config class pass arbitrary parameters through to their proxy.
+    """
+    model_config = ConfigDict(validate_assignment=True, populate_by_name=True, extra='allow')
+
+    name: str | None = Field(default=None,
+                             description='Optional stable handle for this remote. When set, the'
+                                         ' unique_remote_id is (bus_type, name).')
+
+    def unique_remote_id(self, bus_type: str) -> tuple:
+        """Identifier used by callers and the ProtocolProxyManager to address this remote."""
+        return (bus_type, self.name) if self.name else (bus_type, *self._identity())
+
+    def _identity(self) -> tuple:
+        """Fallback identity when no name is given: the hashable proxy parameters, in order."""
+        return tuple(v for v in self.proxy_kwargs().values() if isinstance(v, (str, int, float, bool)))
+
+    def proxy_kwargs(self) -> dict[str, Any]:
+        """Parameters passed to ProtocolProxyManager.get_proxy() and on to the proxy process."""
+        return self.model_dump(exclude={'name'}, exclude_none=True)
 
 
-# TODO: MQTT and NATS configurations should be in their respective repos, but how do they get used/imported here?
 class MQTTConfig(MessageBusConfig):
-    model_config = ConfigDict(validate_assignment=True, populate_by_name=True)
+    """Parameters of protocol_proxy.protocol.mqtt.MQTTProxy."""
     host: str
     port: int = 1883
     keepalive: int = 60
     bind_address: str = ''
     bind_port: int = 0
 
+    def _identity(self) -> tuple:
+        return self.host, self.port
+
 
 class NATSConfig(MessageBusConfig):
-    model_config = ConfigDict(validate_assignment=True, populate_by_name=True)
+    """Parameters of protocol_proxy.protocol.nats.NATSProxy.
+
+    Only a single server URL is supported because parameters travel to the proxy
+    process as command line strings.
+    """
+    servers: str
+
+    def _identity(self) -> tuple:
+        return (self.servers,)
+
+
+# TODO: Bus-specific config classes belong with their proxy plugins. Until the plugins
+#  expose them (e.g. a CONFIG_CLASS attribute next to PROXY_CLASS), they live here.
+ADAPTER_CONFIG_CLASSES: dict[str, type[MessageBusConfig]] = {
+    'mqtt': MQTTConfig,
+    'nats': NATSConfig,
+}
 
 
 class MessageBusAdapterConfig(BaseModel):
     model_config = ConfigDict(validate_assignment=True, populate_by_name=True)
-    bus_type: str
-    adapters: list[MessageBusConfig] = Field(default_factory=list[MessageBusConfig],
-                                             description="List of bus adapter configurations.")
+
+    bus_type: str = Field(default='', description='Protocol plugin name, e.g. "mqtt" or "nats".'
+                                                  ' Resolved to protocol_proxy.protocol.<bus_type>.')
+    adapters: list[SerializeAsAny[MessageBusConfig]] = Field(
+        default_factory=list, description='List of remote bus connections to proxy.')
+    proxy_registration_timeout: float = Field(
+        default=30.0, gt=0, description='Seconds to wait for a newly launched proxy to register.')
 
     @model_validator(mode='before')
-    def validate_adapters(cls, data: dict):
-        match data['bus_type']:
-            case 'mqtt':
-                adapter_config = MQTTConfig
-            case 'nats':
-                adapter_config = NATSConfig
-            case _:
-                adapter_config = MessageBusConfig
-
-        data.update({'adapters': [adapter_config(**a) for a in data['adapters']]})
+    @classmethod
+    def _build_adapters(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        bus_type = str(data.get('bus_type') or '').strip().lower()
+        data['bus_type'] = bus_type
+        config_class = ADAPTER_CONFIG_CLASSES.get(bus_type, MessageBusConfig)
+        adapters = data.get('adapters') or []
+        if not isinstance(adapters, (list, tuple)):
+            raise ValueError(f'"adapters" must be a list, got {type(adapters).__name__}.')
+        built = []
+        for adapter in adapters:
+            if isinstance(adapter, MessageBusConfig):
+                built.append(adapter)
+            elif isinstance(adapter, dict):
+                built.append(config_class(**adapter))
+            else:
+                raise ValueError(f'Adapter entries must be mappings, got {type(adapter).__name__}.')
+        data['adapters'] = built
         return data
+
+    def find_adapter(self, unique_remote_id: tuple | list) -> MessageBusConfig | None:
+        """Return the adapter configuration whose unique_remote_id matches, if any."""
+        wanted = tuple(unique_remote_id)
+        for adapter in self.adapters:
+            if adapter.unique_remote_id(self.bus_type) == wanted:
+                return adapter
+        return None
+
+    def remote_ids(self) -> list[tuple]:
+        return [adapter.unique_remote_id(self.bus_type) for adapter in self.adapters]

@@ -26,130 +26,280 @@ import json
 import logging
 import sys
 
-from functools import partial
+from importlib import import_module
+from typing import Any, Callable, Type
+from uuid import UUID
+
 from pydantic import ValidationError
-from typing import Type, Callable
 
 from volttron.client import Agent
-from volttron.client.messaging.health import STATUS_BAD
-from volttron.client.vip.agent import RPC
+from volttron.client.messaging.health import STATUS_BAD, STATUS_GOOD
+from volttron.client.vip.agent import Core, RPC
 from volttron.utils import load_config, vip_main
 
 from interoperability.resource import ResourceData
 
 from protocol_proxy.ipc import callback, ProtocolHeaders, ProtocolProxyMessage, ProtocolProxyPeer
 from protocol_proxy.manager.gevent import GeventProtocolProxyManager
+from protocol_proxy.proxy import ProtocolProxy
 
 from .config import MessageBusAdapterConfig
 
 _log = logging.getLogger(__name__)
-__version__ = '0.1.0'
+__version__ = '2.0.0rc0'
+
+DEFAULT_TOPIC_DELIMITER = '/'
 
 
 class MessageBusAdapter(Agent):
-    manager_callbacks: tuple[
-        tuple[Callable[[ProtocolHeaders, bytes], None], str], tuple[Callable[[ProtocolHeaders, bytes], None], str]]
+    """Relays publications and subscriptions between VOLTTRON and a foreign message bus.
 
-    def __init__(self, config_path, **kwargs):
+    One ProtocolProxyManager is created for the configured ``bus_type``. Each entry in
+    ``adapters`` describes one remote bus and is run in its own proxy subprocess.
+
+    Message flow:
+      remote -> VOLTTRON: the proxy sends PUBLISH_LOCAL; the topic is resolved to a
+        canonical resource through platform.presentation, transformed, and published.
+      VOLTTRON -> remote: the proxy sends SUBSCRIBE_LOCAL (or a peer calls the
+        ``subscribe``/``publish`` RPCs); matching local publications are transformed
+        and forwarded to the proxy as PUBLISH_REMOTE.
+    """
+
+    def __init__(self, config_path: str | None = None, **kwargs):
         super().__init__(**kwargs)
-        self.config: MessageBusAdapterConfig = MessageBusAdapterConfig(bus_type='', adapters=[])
-        self.ppm: Type[GeventProtocolProxyManager] | GeventProtocolProxyManager = GeventProtocolProxyManager
-        self.manager_callbacks = ((self.handle_publish_local, 'PUBLISH_LOCAL'),
-                                  (self.handle_subscribe_local, 'SUBSCRIBE_LOCAL'))
+        self.config: MessageBusAdapterConfig = MessageBusAdapterConfig()
+        self.ppm: GeventProtocolProxyManager | None = None
+        self._select_loop = None
+        self.manager_callbacks: tuple[tuple[Callable[[ProtocolHeaders, bytes], None], str], ...] = (
+            (self.handle_publish_local, 'PUBLISH_LOCAL'),
+            (self.handle_subscribe_local, 'SUBSCRIBE_LOCAL'),
+        )
         self.resources: dict[str, ResourceData] = {}
-        self.vip.config.subscribe(self.configure_main, ['NEW'], 'config')
+        self._remote_subscriptions: set[tuple[UUID, str]] = set()
+        if config_path:
+            self.vip.config.set_default('config', load_config(config_path))
+        self.vip.config.subscribe(self.configure_main, ['NEW', 'UPDATE'], 'config')
 
     #########################
     # Configuration & Startup
     #########################
 
-    def _load_agent_config(self, config: dict):
+    def _load_agent_config(self, contents: dict) -> MessageBusAdapterConfig | None:
         try:
-            return MessageBusAdapterConfig(**config)
-        except ValidationError as e:
-            _log.warning(f'Validation of platform driver configuration file failed. Using default values. --- {str(e)}')
-            if self.core.connected:  # TODO: Is this a valid way to make sure we are ready to call subsystems?
-                self.vip.health.set_status(STATUS_BAD, f'Error processing configuration: {e}')
-            return MessageBusAdapterConfig(bus_type='', adapters=[])
+            return MessageBusAdapterConfig(**contents)
+        except (ValidationError, TypeError, ValueError) as e:
+            self._report_bad_status(f'Validation of message bus adapter configuration failed: {e}')
+            return None
+
+    def _report_bad_status(self, message: str):
+        _log.error(message)
+        if self.core.connected:    # TODO: Is this a valid way to make sure we are ready to call subsystems?
+            self.vip.health.set_status(STATUS_BAD, message)
 
     def configure_main(self, _, action: str, contents: dict):
-        old_config = self.config.model_copy()  # TODO: deep=True?
         new_config = self._load_agent_config(contents)
-        if action == 'NEW':
-            self.config = new_config
-            self.ppm: GeventProtocolProxyManager = self.ppm.get_manager(self.config.bus_type)
-            for manager_callback in self.manager_callbacks:
-                self.ppm.register_callback(*manager_callback)
-            self.ppm.start()
-            self.core.spawn(self.ppm.select_loop)
-            # for bus in self.config.adapters:
-            #     # TODO: Should proxies be started here, or on demand later?
-        else:
-            pass
+        if new_config is None:
+            return    # Keep the previous configuration.
+        if self.ppm is not None and new_config.bus_type != self.config.bus_type:
+            self._report_bad_status(f'Changing bus_type at runtime ({self.config.bus_type} -> {new_config.bus_type})'
+                                    ' is not supported. Restart the agent. Keeping the existing configuration.')
+            return
+        self.config = new_config
+        if not self.config.bus_type:
+            _log.warning('No bus_type configured. The Message Bus Adapter is idle until a configuration is provided.')
+            return
+        try:
+            if self.ppm is None:
+                self._start_manager(self.config.bus_type)
+        except (ImportError, ValueError, OSError) as e:
+            self._report_bad_status(f'Unable to start proxy manager for bus_type "{self.config.bus_type}": {e}')
+            return
+        # Launch a proxy for each configured remote without blocking the config handler.
+        for unique_remote_id in self.config.remote_ids():
+            self.core.spawn(self._start_remote, unique_remote_id)
+        if self.core.connected:
+            self.vip.health.set_status(STATUS_GOOD, f'Configured for bus_type "{self.config.bus_type}".')
 
-    def _get_resource_data(self, message, headers):
-        if not (data_resource := self.resources.get(message['topic'])):
-            if data_resource := ResourceData.lookup(self, message['topic'], self._get_delimiter(headers)):
-                self.resources[message['topic']] = data_resource
-            else:
-                _log.warning(f'Unable to find Data Resource matching {message["topic"]}')
-        return data_resource
-
-    @callback
-    def handle_publish_local(self,  headers: ProtocolHeaders, raw_message: bytes):
-        message = json.loads(raw_message.decode('utf8'))
-        _log.debug(f"RECEIVED PUBLISH MESSAGE FROM REMOTE: \n\tTOPIC: {message['topic']}\n\tMESSAGE: {message['payload']}")
-        if resource_data := self._get_resource_data(message, headers):
-            transformed_payload = resource_data.transform(message['payload'])
-            self.vip.pubsub.publish('pubsub', topic=resource_data.local_topic, message=transformed_payload)
-
-    @callback
-    def handle_subscribe_local(self,  headers: ProtocolHeaders, raw_message: bytes):
-        message = json.loads(raw_message.decode('utf8'))
-        _log.debug(f"RECEIVED SUBSCRIPTION REQUEST FROM REMOTE: \n\tTOPIC: {message['topic']}\n\tMESSAGE: {message['payload']}")
-        if resource_data := self._get_resource_data(message, headers):
-            manager, peer = self.ppm.get_by_proxy_id(headers.sender_id)
-            if not manager or not peer:
-                _log.warning(f"Incoming subscription request didn't find return path to sender: {headers.sender_id}")
-            resource_data.subscribe(partial(self._publish_remote, manager=manager, peer=peer, topic=message['topic']))
-
-    @RPC.export
-    def subscribe(self, unique_remote_id: tuple, topics: str):
-        # _log.debug('MBA: IN SUBSCRIBE.'):
-        message = ProtocolProxyMessage(
-            method_name='SUBSCRIBE_REMOTE',
-            payload=json.dumps({'topics': topics}).encode('utf8')
-        )
-        manager, peer = self.ppm.get_proxy(unique_remote_id=unique_remote_id, manager_callbacks=self.manager_callbacks)
-        manager.send(remote=peer, message=message)
-        # _log.debug('MBA: SUBSCRIBE COMPLETED.')
-
-    def handle_subscription_request(self, peer, sender, bus, topic, headers, message):
-        pass
-
-    @RPC.export
-    def publish(self, unique_remote_id: tuple, topic: str, payload, transform_key=None):
-        # _log.debug('MBA: IN PUBLISH.')
-        # TODO: Transform_key is no longer used. _publish_remote now expects a transform function.
-        manager, peer = self.ppm.get_proxy(unique_remote_id=unique_remote_id, manager_callbacks=self.manager_callbacks)
-        self._publish_remote(manager, peer, topic, payload) #, transform)
+    def _start_manager(self, bus_type: str):
+        proxy_class = self._resolve_proxy_class(bus_type)
+        self.ppm = GeventProtocolProxyManager.get_manager(proxy_class, self.manager_callbacks)
+        # get_manager only registers callbacks when it creates the manager; registering is idempotent.
+        for manager_callback in self.manager_callbacks:
+            self.ppm.register_callback(*manager_callback)
+        self.ppm.start()
+        self._select_loop = self.core.spawn(self.ppm.select_loop)
 
     @staticmethod
-    def _publish_remote(manager: GeventProtocolProxyManager, peer: ProtocolProxyPeer,
-                        topic: str, payload):
+    def _resolve_proxy_class(bus_type: str) -> Type[ProtocolProxy]:
+        """Find the ProtocolProxy subclass for a bus type.
+
+        Prefers the plugin's PROXY_CLASS attribute (as ProtocolProxyManager.get_manager does)
+        but falls back to the single ProtocolProxy subclass defined by the plugin package.
+        """
+        module_name = f'protocol_proxy.protocol.{bus_type}'
+        try:
+            module = import_module(module_name)
+        except ImportError as e:
+            raise ImportError(f'No protocol proxy plugin found for bus_type "{bus_type}" ({module_name}): {e}') from e
+        proxy_class = getattr(module, 'PROXY_CLASS', None)
+        if isinstance(proxy_class, type) and issubclass(proxy_class, ProtocolProxy):
+            return proxy_class
+        candidates = [obj for obj in vars(module).values()
+                      if isinstance(obj, type) and issubclass(obj, ProtocolProxy)
+                      and obj.__module__.startswith(module_name)]
+        if len(candidates) == 1:
+            return candidates[0]
+        raise ValueError(f'{module_name} does not define PROXY_CLASS and has {len(candidates)}'
+                         ' ProtocolProxy subclasses; cannot choose one.')
+
+    def _start_remote(self, unique_remote_id: tuple):
+        try:
+            self._get_peer(unique_remote_id)
+        except (ValueError, TimeoutError, RuntimeError) as e:
+            _log.warning(f'Unable to start proxy for {unique_remote_id}: {e}')
+
+    def _get_peer(self, unique_remote_id: tuple | list) -> ProtocolProxyPeer:
+        """Get (launching if necessary) the registered proxy peer for a configured remote."""
+        if self.ppm is None:
+            raise RuntimeError('The Message Bus Adapter has not been configured with a bus_type.')
+        unique_remote_id = tuple(unique_remote_id)
+        adapter = self.config.find_adapter(unique_remote_id)
+        if adapter is None:
+            raise ValueError(f'No adapter is configured for remote {unique_remote_id}.'
+                             f' Known remotes: {self.config.remote_ids()}')
+        peer = self.ppm.get_proxy(unique_remote_id, **adapter.proxy_kwargs())
+        if peer.socket_params is None:
+            # The proxy process must register its socket before anything can be sent to it.
+            self.ppm.wait_peer_registered(peer, self.config.proxy_registration_timeout)
+            if peer.socket_params is None:
+                raise TimeoutError(f'Proxy for {unique_remote_id} did not register within'
+                                   f' {self.config.proxy_registration_timeout} seconds.')
+        return peer
+
+    @Core.receiver('onstop')
+    def onstop(self, sender, **kwargs):
+        if self.ppm is not None:
+            self.ppm.stop()
+
+    ###################
+    # Remote -> Local
+    ###################
+
+    def _get_resource_data(self, topic: str, headers: ProtocolHeaders) -> ResourceData | None:
+        if not (resource_data := self.resources.get(topic)):
+            if resource_data := ResourceData.lookup(self, topic, self._get_delimiter(headers)):
+                self.resources[topic] = resource_data
+            else:
+                _log.warning(f'Unable to find Data Resource matching {topic}')
+        return resource_data
+
+    @staticmethod
+    def _decode_remote_payload(payload: Any) -> Any:
+        """Decode payloads as sent by the MQTT and NATS proxies: hex-encoded bytes holding
+        UTF-8 text, usually JSON. Anything that does not fit that shape is returned as-is."""
+        if not isinstance(payload, str):
+            return payload
+        try:
+            raw = bytes.fromhex(payload)
+        except ValueError:
+            return payload
+        try:
+            text = raw.decode('utf8')
+        except UnicodeDecodeError:
+            return raw
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+
+    @callback
+    def handle_publish_local(self, headers: ProtocolHeaders, raw_message: bytes):
+        message = json.loads(raw_message.decode('utf8'))
+        topic = message.get('topic')
+        if not topic:
+            _log.warning(f'Received PUBLISH_LOCAL without a topic from {headers.sender_id}: {message}')
+            return
+        payload = self._decode_remote_payload(message.get('payload'))
+        _log.debug(f'RECEIVED PUBLISH MESSAGE FROM REMOTE: \n\tTOPIC: {topic}\n\tMESSAGE: {payload}')
+        if resource_data := self._get_resource_data(topic, headers):
+            transformed_payload = resource_data.transform.execute(payload)
+            local_topic = resource_data.resource_def.get('publication_topic') or resource_data.local_topic
+            self.vip.pubsub.publish('pubsub', topic=local_topic, message=transformed_payload)
+
+    ###################
+    # Local -> Remote
+    ###################
+
+    @callback
+    def handle_subscribe_local(self, headers: ProtocolHeaders, raw_message: bytes):
+        message = json.loads(raw_message.decode('utf8'))
+        topics = message.get('topics') or ([message['topic']] if message.get('topic') else [])
+        if isinstance(topics, str):
+            topics = [topics]
+        _log.debug(f'RECEIVED SUBSCRIPTION REQUEST FROM REMOTE: \n\tTOPICS: {topics}')
+        manager, peer = GeventProtocolProxyManager.get_by_proxy_id(headers.sender_id)
+        if manager is None or peer is None:
+            _log.warning(f"Incoming subscription request didn't find return path to sender: {headers.sender_id}")
+            return
+        for topic in topics:
+            key = (peer.proxy_id, topic)
+            if key in self._remote_subscriptions:
+                continue
+            if resource_data := self._get_resource_data(topic, headers):
+                resource_data.subscribe(self._make_remote_relay(manager, peer, topic))
+                self._remote_subscriptions.add(key)
+
+    def _make_remote_relay(self, manager: GeventProtocolProxyManager, peer: ProtocolProxyPeer, remote_topic: str
+                           ) -> Callable:
+        """Build a VIP pubsub callback that forwards (already transformed) local messages to a remote."""
+        def relay_to_remote(_peer, _sender, _bus, _topic, _headers, message):
+            self._publish_remote(manager, peer, remote_topic, message)
+        return relay_to_remote
+
+    @staticmethod
+    def _publish_remote(manager: GeventProtocolProxyManager, peer: ProtocolProxyPeer, topic: str, payload) -> bool:
         message = ProtocolProxyMessage(
             method_name='PUBLISH_REMOTE',
             payload=json.dumps({'topic': topic, 'payload': payload}).encode('utf8')
         )
-        manager.send(remote=peer, message=message)
+        return bool(manager.send(remote=peer, message=message))
 
-    def handle_publish_request(self, peer, sender, bus, topic, headers, message):
-        pass
+    ###################
+    # RPC Interface
+    ###################
 
-    def _get_delimiter(self, headers: ProtocolHeaders) -> str | None:
-        manager, _ = self.ppm.get_by_proxy_id(headers.sender_id)
-        delimiter = manager.proxy_class.topic_delimiter() if hasattr(manager.proxy_class, 'topic_delimiter') else None
-        return delimiter
+    @RPC.export
+    def list_remotes(self) -> list[list]:
+        """Return the unique_remote_ids of all configured remotes."""
+        return [list(remote_id) for remote_id in self.config.remote_ids()]
+
+    @RPC.export
+    def subscribe(self, unique_remote_id: tuple | list, topics: str | list[str]) -> bool:
+        """Ask the remote bus identified by unique_remote_id to subscribe to topics."""
+        topics = [topics] if isinstance(topics, str) else list(topics)
+        peer = self._get_peer(unique_remote_id)
+        message = ProtocolProxyMessage(
+            method_name='SUBSCRIBE_REMOTE',
+            payload=json.dumps({'topics': topics}).encode('utf8')
+        )
+        return bool(self.ppm.send(remote=peer, message=message))
+
+    @RPC.export
+    def publish(self, unique_remote_id: tuple | list, topic: str, payload) -> bool:
+        """Publish payload to topic on the remote bus identified by unique_remote_id."""
+        peer = self._get_peer(unique_remote_id)
+        return self._publish_remote(self.ppm, peer, topic, payload)
+
+    ###################
+    # Helpers
+    ###################
+
+    @staticmethod
+    def _get_delimiter(headers: ProtocolHeaders) -> str:
+        manager, _ = GeventProtocolProxyManager.get_by_proxy_id(headers.sender_id)
+        delimiter_func = getattr(getattr(manager, 'proxy_class', None), 'topic_delimiter', None)
+        return delimiter_func() if callable(delimiter_func) else DEFAULT_TOPIC_DELIMITER
+
 
 def main():
     """Main method called to start the agent."""
