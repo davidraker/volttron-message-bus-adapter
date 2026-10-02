@@ -89,3 +89,14 @@ def test_nats_servers_joined_for_command_line():
     assert config.remote_ids() == [('nats', 'nats://a:4222,nats://b:4222')]
     with pytest.raises(ValidationError):
         MessageBusAdapterConfig(bus_type='nats', adapters=[{'servers': ''}])
+
+
+def test_subscription_lists_stay_out_of_proxy_kwargs():
+    config = MessageBusAdapterConfig(bus_type='mqtt', adapters=[
+        {'name': 'r', 'host': 'h', 'local_subscriptions': ['openfmb/essmodule/ESSReadingProfile/m1'],
+         'remote_subscriptions': ['openfmb/essmodule/ESSControlProfile/m1']}])
+    adapter = config.adapters[0]
+    assert adapter.local_subscriptions == ['openfmb/essmodule/ESSReadingProfile/m1']
+    assert adapter.remote_subscriptions == ['openfmb/essmodule/ESSControlProfile/m1']
+    assert adapter.proxy_kwargs() == {'host': 'h', 'port': 1883, 'keepalive': 60, 'bind_address': '', 'bind_port': 0}
+    assert MessageBusAdapterConfig(bus_type='mqtt', adapters=[{'host': 'h'}]).adapters[0].local_subscriptions == []

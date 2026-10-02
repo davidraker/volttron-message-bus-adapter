@@ -40,6 +40,15 @@ class MessageBusConfig(BaseModel):
     name: str | None = Field(default=None,
                              description='Optional stable handle for this remote. When set, the'
                                          ' unique_remote_id is (bus_type, name).')
+    local_subscriptions: list[str] = Field(
+        default_factory=list, exclude=True,
+        description='Remote topics to serve from local data as soon as the proxy is up: each is resolved through'
+                    ' platform.presentation to a canonical resource whose publications are transformed and'
+                    ' published to that remote topic continuously (the same as a SUBSCRIBE_LOCAL request).')
+    remote_subscriptions: list[str] = Field(
+        default_factory=list, exclude=True,
+        description='Remote topics the proxy subscribes to on the foreign bus as soon as it is up; messages'
+                    ' arriving on them are relayed into VOLTTRON (the same as the subscribe RPC).')
 
     def unique_remote_id(self, bus_type: str) -> tuple:
         """Identifier used by callers and the ProtocolProxyManager to address this remote."""
@@ -50,7 +59,8 @@ class MessageBusConfig(BaseModel):
         return tuple(v for v in self.proxy_kwargs().values() if isinstance(v, (str, int, float, bool)))
 
     def proxy_kwargs(self) -> dict[str, Any]:
-        """Parameters passed to ProtocolProxyManager.get_proxy() and on to the proxy process."""
+        """Parameters passed to ProtocolProxyManager.get_proxy() and on to the proxy process. The subscription
+        lists are the adapter's own (``exclude=True``) and never reach the proxy command line."""
         return self.model_dump(exclude={'name'}, exclude_none=True)
 
 

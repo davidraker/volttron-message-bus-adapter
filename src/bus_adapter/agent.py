@@ -59,10 +59,13 @@ class MessageBusAdapter(Agent):
 
     Message flow:
       remote -> VOLTTRON: the proxy sends PUBLISH_LOCAL; the topic is resolved to a
-        canonical resource through platform.presentation, transformed, and published.
-      VOLTTRON -> remote: the proxy sends SUBSCRIBE_LOCAL (or a peer calls the
-        ``subscribe``/``publish`` RPCs); matching local publications are transformed
-        and forwarded to the proxy as PUBLISH_REMOTE.
+        canonical resource through platform.presentation, decoded if the alias declares
+        a binary encoding, transformed, and published.
+      VOLTTRON -> remote: a remote topic listed in the adapter's ``local_subscriptions``
+        (or sent by the proxy as SUBSCRIBE_LOCAL) is resolved the same way; matching local
+        publications are transformed, encoded and forwarded to the proxy as PUBLISH_REMOTE.
+        Binary payloads travel hex-encoded with ``"encoding": "hex"`` in the envelope.
+      A peer may also call the ``subscribe``/``publish`` RPCs.
     """
 
     def __init__(self, config_path: str | None = None, **kwargs):
@@ -153,10 +156,19 @@ class MessageBusAdapter(Agent):
                          ' ProtocolProxy subclasses; cannot choose one.')
 
     def _start_remote(self, unique_remote_id: tuple):
+        """Launch the proxy for a configured remote and apply its config-declared subscriptions."""
         try:
-            self._get_peer(unique_remote_id)
+            peer = self._get_peer(unique_remote_id)
         except (ValueError, TimeoutError, RuntimeError) as e:
             _log.warning(f'Unable to start proxy for {unique_remote_id}: {e}')
+            return
+        adapter = self.config.find_adapter(tuple(unique_remote_id))
+        if adapter is None:
+            return
+        if adapter.local_subscriptions:
+            self._subscribe_local(self.ppm, peer, list(adapter.local_subscriptions))
+        if adapter.remote_subscriptions:
+            self.subscribe(unique_remote_id, list(adapter.remote_subscriptions))
 
     def _get_peer(self, unique_remote_id: tuple | list) -> ProtocolProxyPeer:
         """Get (launching if necessary) the registered proxy peer for a configured remote."""
@@ -185,9 +197,9 @@ class MessageBusAdapter(Agent):
     # Remote -> Local
     ###################
 
-    def _get_resource_data(self, topic: str, headers: ProtocolHeaders) -> ResourceData | None:
+    def _get_resource_data(self, topic: str, delimiter: str = DEFAULT_TOPIC_DELIMITER) -> ResourceData | None:
         if not (resource_data := self.resources.get(topic)):
-            if resource_data := ResourceData.lookup(self, topic, self._get_delimiter(headers)):
+            if resource_data := ResourceData.lookup(self, topic, delimiter):
                 self.resources[topic] = resource_data
             else:
                 _log.warning(f'Unable to find Data Resource matching {topic}')
@@ -221,8 +233,9 @@ class MessageBusAdapter(Agent):
             return
         payload = self._decode_remote_payload(message.get('payload'))
         _log.debug(f'RECEIVED PUBLISH MESSAGE FROM REMOTE: \n\tTOPIC: {topic}\n\tMESSAGE: {payload}')
-        if resource_data := self._get_resource_data(topic, headers):
-            transformed_payload = resource_data.transform.execute(payload)
+        if resource_data := self._get_resource_data(topic, self._get_delimiter(headers)):
+            # Binary payloads (protobuf) are decoded by the alias's codec; JSON has already been parsed above.
+            transformed_payload = resource_data.transform.execute(resource_data.decode(payload))
             local_topic = resource_data.resource_def.get('publication_topic') or resource_data.local_topic
             self.vip.pubsub.publish('pubsub', topic=local_topic, message=transformed_payload)
 
@@ -241,13 +254,21 @@ class MessageBusAdapter(Agent):
         if manager is None or peer is None:
             _log.warning(f"Incoming subscription request didn't find return path to sender: {headers.sender_id}")
             return
+        self._subscribe_local(manager, peer, topics)
+
+    def _subscribe_local(self, manager: GeventProtocolProxyManager, peer: ProtocolProxyPeer, topics: list[str]):
+        """Serve remote topics from local data: resolve each through platform.presentation, subscribe to the
+        canonical resource's publications and relay them, transformed and encoded, to the peer. Topics already
+        served to this peer are skipped, so repeated requests and configuration reloads are harmless."""
+        delimiter = self._delimiter_for(manager)
         for topic in topics:
             key = (peer.proxy_id, topic)
             if key in self._remote_subscriptions:
                 continue
-            if resource_data := self._get_resource_data(topic, headers):
+            if resource_data := self._get_resource_data(topic, delimiter):
                 resource_data.subscribe(self._make_remote_relay(manager, peer, topic))
                 self._remote_subscriptions.add(key)
+                _log.info(f'Serving remote topic "{topic}" from {resource_data.resource_def.get("publication_topic")}')
 
     def _make_remote_relay(self, manager: GeventProtocolProxyManager, peer: ProtocolProxyPeer, remote_topic: str
                            ) -> Callable:
@@ -258,10 +279,13 @@ class MessageBusAdapter(Agent):
 
     @staticmethod
     def _publish_remote(manager: GeventProtocolProxyManager, peer: ProtocolProxyPeer, topic: str, payload) -> bool:
-        message = ProtocolProxyMessage(
-            method_name='PUBLISH_REMOTE',
-            payload=json.dumps({'topic': topic, 'payload': payload}).encode('utf8')
-        )
+        """Send PUBLISH_REMOTE. JSON-serializable payloads go as they are; ``bytes`` (a protobuf message) are
+        hex-encoded and flagged with ``"encoding": "hex"`` so the proxy publishes the raw bytes."""
+        if isinstance(payload, (bytes, bytearray)):
+            body = {'topic': topic, 'payload': bytes(payload).hex(), 'encoding': 'hex'}
+        else:
+            body = {'topic': topic, 'payload': payload}
+        message = ProtocolProxyMessage(method_name='PUBLISH_REMOTE', payload=json.dumps(body).encode('utf8'))
         return bool(manager.send(remote=peer, message=message))
 
     ###################
@@ -295,10 +319,15 @@ class MessageBusAdapter(Agent):
     ###################
 
     @staticmethod
-    def _get_delimiter(headers: ProtocolHeaders) -> str:
-        manager, _ = GeventProtocolProxyManager.get_by_proxy_id(headers.sender_id)
+    def _delimiter_for(manager) -> str:
+        """The topic delimiter of a manager's proxy class (``/`` for MQTT, ``.`` for NATS)."""
         delimiter_func = getattr(getattr(manager, 'proxy_class', None), 'topic_delimiter', None)
         return delimiter_func() if callable(delimiter_func) else DEFAULT_TOPIC_DELIMITER
+
+    @classmethod
+    def _get_delimiter(cls, headers: ProtocolHeaders) -> str:
+        manager, _ = GeventProtocolProxyManager.get_by_proxy_id(headers.sender_id)
+        return cls._delimiter_for(manager)
 
 
 def main():

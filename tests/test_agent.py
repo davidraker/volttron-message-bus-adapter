@@ -108,6 +108,7 @@ def test_handle_publish_local_transforms_and_publishes(adapter):
     manager = adapter.ppm
     peer, headers = _remote(adapter, manager)
     resource = mock.MagicMock()
+    resource.decode.side_effect = lambda payload: payload       # a JSON alias: nothing to decode
     resource.transform.execute.return_value = {'out': 1}
     resource.resource_def = {'publication_topic': 'devices/x'}
     resource.local_topic = 'a/b/c'
@@ -226,3 +227,63 @@ def test_resolve_proxy_class_fallback_without_PROXY_CLASS():
     module.PROXY_CLASS = FakeProxy
     with mock.patch.dict('sys.modules', {'protocol_proxy.protocol.fake': module}):
         assert MessageBusAdapter._resolve_proxy_class('fake') is FakeProxy
+
+
+def test_start_remote_applies_configured_subscriptions(adapter):
+    adapter.config = MessageBusAdapterConfig(bus_type='mqtt', adapters=[
+        {'name': 'r1', 'host': 'h', 'port': 1, 'local_subscriptions': ['openfmb/a', 'openfmb/b'],
+         'remote_subscriptions': ['openfmb/c']}])
+    peer = FakePeer()
+    with mock.patch.object(adapter, '_get_peer', return_value=peer), \
+         mock.patch.object(adapter, '_subscribe_local') as subscribe_local, \
+         mock.patch.object(adapter, 'subscribe') as subscribe:
+        adapter._start_remote(('mqtt', 'r1'))
+    subscribe_local.assert_called_once_with(adapter.ppm, peer, ['openfmb/a', 'openfmb/b'])
+    subscribe.assert_called_once_with(('mqtt', 'r1'), ['openfmb/c'])
+    # Nothing declared: nothing sent. A proxy that fails to start is only logged.
+    adapter.config = MessageBusAdapterConfig(bus_type='mqtt', adapters=[{'name': 'r1', 'host': 'h', 'port': 1}])
+    with mock.patch.object(adapter, '_get_peer', return_value=peer), \
+         mock.patch.object(adapter, '_subscribe_local') as subscribe_local:
+        adapter._start_remote(('mqtt', 'r1'))
+    subscribe_local.assert_not_called()
+    with mock.patch.object(adapter, '_get_peer', side_effect=TimeoutError('late')):
+        adapter._start_remote(('mqtt', 'r1'))
+
+
+def test_subscribe_local_resolves_with_the_proxy_delimiter_and_relays(adapter):
+    manager = adapter.ppm
+    peer, _ = _remote(adapter, manager)
+    manager.proxy_class = mock.MagicMock(topic_delimiter=mock.Mock(return_value='.'))
+    resource = mock.MagicMock()
+    resource.resource_def = {'publication_topic': 'devices/ess/all'}
+    with mock.patch.object(agent_module.ResourceData, 'lookup', return_value=resource) as lookup:
+        adapter._subscribe_local(manager, peer, ['openfmb.essmodule.ESSReadingProfile.m1'])
+        adapter._subscribe_local(manager, peer, ['openfmb.essmodule.ESSReadingProfile.m1'])    # already served
+    lookup.assert_called_once_with(adapter, 'openfmb.essmodule.ESSReadingProfile.m1', '.')
+    resource.subscribe.assert_called_once()
+    relay = resource.subscribe.call_args.args[0]
+    relay('pubsub', 'sender', 'bus', 'devices/ess/all', {}, b'\x0a\x02\x08\x01')      # ResourceData already encoded it
+    sent = json.loads(manager.send.call_args.kwargs['message'].payload)
+    assert sent == {'topic': 'openfmb.essmodule.ESSReadingProfile.m1', 'payload': '0a020801', 'encoding': 'hex'}
+
+
+def test_publish_remote_envelopes(adapter):
+    peer = FakePeer()
+    MessageBusAdapter._publish_remote(adapter.ppm, peer, 't', {'v': 1})
+    assert json.loads(adapter.ppm.send.call_args.kwargs['message'].payload) == {'topic': 't', 'payload': {'v': 1}}
+    MessageBusAdapter._publish_remote(adapter.ppm, peer, 't', bytearray(b'\xff\x00'))
+    assert json.loads(adapter.ppm.send.call_args.kwargs['message'].payload) == {'topic': 't', 'payload': 'ff00', 'encoding': 'hex'}
+
+
+def test_handle_publish_local_decodes_binary_payloads(adapter):
+    manager = adapter.ppm
+    peer, headers = _remote(adapter, manager)
+    resource = mock.MagicMock()
+    resource.decode.side_effect = lambda payload: {'decoded': payload.hex()} if isinstance(payload, bytes) else payload
+    resource.transform.execute.side_effect = lambda payload: payload
+    resource.resource_def = {'publication_topic': 'devices/x'}
+    with mock.patch.object(GeventProtocolProxyManager, 'get_by_proxy_id', return_value=(manager, peer)), \
+         mock.patch.object(agent_module.ResourceData, 'lookup', return_value=resource):
+        raw = json.dumps({'topic': 'a/b/c', 'payload': b'\xff\xfe'.hex()}).encode()      # not UTF-8: stays bytes
+        adapter.handle_publish_local(manager, headers, raw)
+    adapter.vip.pubsub.publish.assert_called_with('pubsub', topic='devices/x', message={'decoded': 'fffe'})
