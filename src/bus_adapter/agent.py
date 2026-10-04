@@ -37,6 +37,7 @@ from volttron.client.messaging.health import STATUS_BAD, STATUS_GOOD
 from volttron.client.vip.agent import Core, RPC
 from volttron.utils import load_config, vip_main
 
+from interoperability import openfmb_bus
 from interoperability.resource import ResourceData
 
 from protocol_proxy.ipc import callback, ProtocolHeaders, ProtocolProxyMessage, ProtocolProxyPeer
@@ -57,15 +58,23 @@ class MessageBusAdapter(Agent):
     One ProtocolProxyManager is created for the configured ``bus_type``. Each entry in
     ``adapters`` describes one remote bus and is run in its own proxy subprocess.
 
-    Message flow:
+    Message flow in ``translate`` mode (the default):
       remote -> VOLTTRON: the proxy sends PUBLISH_LOCAL; the topic is resolved to a
-        canonical resource through platform.presentation, decoded if the alias declares
-        a binary encoding, transformed, and published.
+        canonical resource through platform.presentation and decoded if the alias declares
+        a binary encoding. A resource with an ``rpc_topic`` is a device: the message is a
+        command for it and is written through the Device Adapter's ``write`` RPC, the result
+        going back to the remote on ``<topic>/result`` (``/error`` when points were refused).
+        Otherwise it is remote-owned telemetry: transformed and published locally.
       VOLTTRON -> remote: a remote topic listed in the adapter's ``local_subscriptions``
         (or sent by the proxy as SUBSCRIBE_LOCAL) is resolved the same way; matching local
         publications are transformed, encoded and forwarded to the proxy as PUBLISH_REMOTE.
         Binary payloads travel hex-encoded with ``"encoding": "hex"`` in the envelope.
-      A peer may also call the ``subscribe``/``publish`` RPCs.
+    In ``relay`` mode the remote's messages live on the VOLTTRON bus under the remote topic
+    itself, in the alias format's JSON form with the headers of ``interoperability.openfmb_bus``
+    (OpenFMB on the VOLTTRON bus): inbound messages are decoded and republished there, local
+    publications on those topics (other than the adapter's own) are encoded and sent out. The
+    Device Adapter, or any OpenFMB-aware agent, does the translating.
+    A peer may also call the ``subscribe``/``publish`` RPCs.
     """
 
     def __init__(self, config_path: str | None = None, **kwargs):
@@ -233,11 +242,53 @@ class MessageBusAdapter(Agent):
             return
         payload = self._decode_remote_payload(message.get('payload'))
         _log.debug(f'RECEIVED PUBLISH MESSAGE FROM REMOTE: \n\tTOPIC: {topic}\n\tMESSAGE: {payload}')
-        if resource_data := self._get_resource_data(topic, self._get_delimiter(headers)):
-            # Binary payloads (protobuf) are decoded by the alias's codec; JSON has already been parsed above.
-            transformed_payload = resource_data.transform.execute(resource_data.decode(payload))
-            local_topic = resource_data.resource_def.get('publication_topic') or resource_data.local_topic
-            self.vip.pubsub.publish('pubsub', topic=local_topic, message=transformed_payload)
+        delimiter = self._get_delimiter(headers)
+        if not (resource_data := self._get_resource_data(topic, delimiter)):
+            return
+        # Binary payloads (protobuf) are decoded by the alias's codec; JSON has already been parsed above.
+        decoded = resource_data.decode(payload)
+        resource_def = resource_data.resource_def
+        if self.config.mode == 'relay':
+            # OpenFMB on the VOLTTRON bus: the message keeps its topic and format; only the encoding changed.
+            manager, peer = GeventProtocolProxyManager.get_by_proxy_id(headers.sender_id)
+            remote = getattr(peer, 'proxy_name', None) or headers.sender_id
+            self.vip.pubsub.publish('pubsub', topic=self._local_topic(topic, delimiter), message=decoded,
+                                    headers=openfmb_bus.headers((resource_def.get('codec') or {}).get('proto'), self.identity, remote))
+            return
+        if self.config.inbound_writes and resource_def.get('rpc_topic'):
+            self._write_through_device_adapter(headers, topic, delimiter, resource_def, decoded)
+            return
+        transformed_payload = resource_data.transform.execute(decoded)
+        local_topic = resource_def.get('publication_topic') or resource_data.local_topic
+        self.vip.pubsub.publish('pubsub', topic=local_topic, message=transformed_payload)
+
+    def _write_through_device_adapter(self, headers: ProtocolHeaders, topic: str, delimiter: str, resource_def: dict, message):
+        """A remote message for a device behind the driver: the Device Adapter transforms and writes it; the result
+        (written points, refused points, the chain's path) goes back to the remote on <topic>/result and /error."""
+        uai = topic.split(delimiter)
+        manager, peer = GeventProtocolProxyManager.get_by_proxy_id(headers.sender_id)
+        try:
+            result = self.vip.rpc.call(self.config.device_adapter, 'write', uai, message,
+                                       resource_def.get('target_format')).get(timeout=self.config.rpc_timeout)
+        except Exception as e:
+            _log.warning(f'Write of {topic} through {self.config.device_adapter} failed: {e!r}')
+            result = {'target': resource_def.get('rpc_topic'), 'written': {}, 'errors': {'*': f'{type(e).__name__}: {e}'}}
+        if manager is not None and peer is not None:
+            self._publish_remote(manager, peer, f'{topic}{delimiter}result', result)
+            if result.get('errors'):
+                self._publish_remote(manager, peer, f'{topic}{delimiter}error', {'target': result.get('target'), 'errors': result['errors']})
+        else:
+            _log.warning(f'No return path to {headers.sender_id} for the result of writing {topic}.')
+
+    @property
+    def identity(self) -> str:
+        identity = getattr(self.core, 'identity', None)
+        return identity if isinstance(identity, str) else 'platform.bus_adapter'
+
+    @staticmethod
+    def _local_topic(remote_topic: str, delimiter: str) -> str:
+        """The VOLTTRON topic of a remote topic: the same segments joined with '/'."""
+        return remote_topic if delimiter == DEFAULT_TOPIC_DELIMITER else DEFAULT_TOPIC_DELIMITER.join(remote_topic.split(delimiter))
 
     ###################
     # Local -> Remote
@@ -266,9 +317,26 @@ class MessageBusAdapter(Agent):
             if key in self._remote_subscriptions:
                 continue
             if resource_data := self._get_resource_data(topic, delimiter):
-                resource_data.subscribe(self._make_remote_relay(manager, peer, topic))
+                if self.config.mode == 'relay':
+                    # The topic lives on the VOLTTRON bus as well: forward what others publish there, re-encoded.
+                    local_topic = self._local_topic(topic, delimiter)
+                    self.vip.pubsub.subscribe(peer='pubsub', prefix=local_topic,
+                                              callback=self._make_bus_relay(manager, peer, topic, local_topic, resource_data))
+                    _log.info(f'Relaying local publications on "{local_topic}" to remote topic "{topic}"')
+                else:
+                    resource_data.subscribe(self._make_remote_relay(manager, peer, topic))
+                    _log.info(f'Serving remote topic "{topic}" from {resource_data.resource_def.get("publication_topic")}')
                 self._remote_subscriptions.add(key)
-                _log.info(f'Serving remote topic "{topic}" from {resource_data.resource_def.get("publication_topic")}')
+
+    def _make_bus_relay(self, manager: GeventProtocolProxyManager, peer: ProtocolProxyPeer, remote_topic: str, local_topic: str,
+                        resource_data: ResourceData) -> Callable:
+        """Relay mode: encode what other agents publish on the local topic and send it to the remote; the adapter's
+        own inbound republications carry its identity as origin and are not sent back."""
+        def relay_to_remote(_peer, _sender, _bus, topic, message_headers, message):
+            if topic != local_topic or openfmb_bus.origin_of(message_headers) == self.identity:
+                return
+            self._publish_remote(manager, peer, remote_topic, resource_data.encode(message))
+        return relay_to_remote
 
     def _make_remote_relay(self, manager: GeventProtocolProxyManager, peer: ProtocolProxyPeer, remote_topic: str
                            ) -> Callable:
