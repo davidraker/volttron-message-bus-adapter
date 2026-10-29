@@ -4,6 +4,8 @@ from uuid import uuid4
 
 import pytest
 
+from interoperability import openfmb_bus
+
 from bus_adapter import agent as agent_module
 from bus_adapter.agent import MessageBusAdapter
 from bus_adapter.config import MessageBusAdapterConfig
@@ -104,23 +106,22 @@ def _remote(adapter, manager):
     return peer, headers
 
 
-def test_handle_publish_local_transforms_and_publishes(adapter):
+def test_handle_publish_local_republishes_on_the_topic_and_caches_the_lookup(adapter):
     manager = adapter.ppm
     peer, headers = _remote(adapter, manager)
     resource = mock.MagicMock()
     resource.decode.side_effect = lambda payload: payload       # a JSON alias: nothing to decode
-    resource.transform.execute.return_value = {'out': 1}
-    resource.resource_def = {'publication_topic': 'devices/x'}
-    resource.local_topic = 'a/b/c'
+    resource.resource_def = {'codec': {'proto': 'solarmodule.SolarReadingProfile'}}
     with mock.patch.object(GeventProtocolProxyManager, 'get_by_proxy_id', return_value=(manager, peer)), \
          mock.patch.object(agent_module.ResourceData, 'lookup', return_value=resource) as lookup:
         raw = json.dumps({'topic': 'a/b/c', 'payload': json.dumps({'in': 1}).encode().hex()}).encode()
         adapter.handle_publish_local(manager, headers, raw)
         adapter.handle_publish_local(manager, headers, raw)    # second call uses the cache
     lookup.assert_called_once_with(adapter, 'a/b/c', '/', strict=True)    # inbound: the exact topic, no prefix fallback
-    resource.transform.execute.assert_called_with({'in': 1})
-    adapter.vip.pubsub.publish.assert_called_with('pubsub', topic='devices/x', message={'out': 1})
-
+    assert adapter.vip.pubsub.publish.call_count == 2
+    call = adapter.vip.pubsub.publish.call_args
+    assert call.kwargs['topic'] == 'a/b/c' and call.kwargs['message'] == {'in': 1}
+    assert openfmb_bus.origin_of(call.kwargs['headers']) == adapter.identity   # so its own republication is not sent back
 
 def test_handle_publish_local_rejects_unauthenticated_sender(adapter):
     manager = adapter.ppm
@@ -131,24 +132,24 @@ def test_handle_publish_local_rejects_unauthenticated_sender(adapter):
     lookup.assert_not_called()
 
 
-def test_handle_subscribe_local_relays_with_pubsub_signature(adapter):
+def test_handle_subscribe_local_relays_local_publications_to_the_remote(adapter):
     manager = adapter.ppm
     peer, headers = _remote(adapter, manager)
     resource = mock.MagicMock()
+    resource.encode.side_effect = lambda message: message
     with mock.patch.object(GeventProtocolProxyManager, 'get_by_proxy_id', return_value=(manager, peer)), \
          mock.patch.object(agent_module.ResourceData, 'lookup', return_value=resource):
         raw = json.dumps({'topic': 'remote/topic'}).encode()
         adapter.handle_subscribe_local(manager, headers, raw)
         adapter.handle_subscribe_local(manager, headers, raw)    # duplicate is ignored
-    resource.subscribe.assert_called_once()
-    relay = resource.subscribe.call_args.args[0]
-    # ResourceData.subscribe invokes the callback with the VIP pubsub signature.
-    relay('pubsub', 'sender', 'bus', 'remote/topic', {}, {'transformed': True})
+    adapter.vip.pubsub.subscribe.assert_called_once()
+    assert adapter.vip.pubsub.subscribe.call_args.kwargs['prefix'] == 'remote/topic'
+    relay = adapter.vip.pubsub.subscribe.call_args.kwargs['callback']
+    relay('pubsub', 'sender', 'bus', 'remote/topic', {}, {'local': True})           # another agent's publication
     manager.send.assert_called_once()
     sent = manager.send.call_args.kwargs
     assert sent['remote'] is peer
-    assert json.loads(sent['message'].payload) == {'topic': 'remote/topic', 'payload': {'transformed': True}}
-
+    assert json.loads(sent['message'].payload) == {'topic': 'remote/topic', 'payload': {'local': True}}
 
 def test_handle_subscribe_local_without_return_path(adapter):
     manager = adapter.ppm
@@ -255,17 +256,18 @@ def test_subscribe_local_resolves_with_the_proxy_delimiter_and_relays(adapter):
     peer, _ = _remote(adapter, manager)
     manager.proxy_class = mock.MagicMock(topic_delimiter=mock.Mock(return_value='.'))
     resource = mock.MagicMock()
-    resource.resource_def = {'publication_topic': 'devices/ess/all'}
+    resource.encode.side_effect = lambda message: b'\x0a\x02\x08\x01'          # the alias's protobuf codec
     with mock.patch.object(agent_module.ResourceData, 'lookup', return_value=resource) as lookup:
         adapter._subscribe_local(manager, peer, ['openfmb.essmodule.ESSReadingProfile.m1'])
         adapter._subscribe_local(manager, peer, ['openfmb.essmodule.ESSReadingProfile.m1'])    # already served
     lookup.assert_called_once_with(adapter, 'openfmb.essmodule.ESSReadingProfile.m1', '.', strict=False)   # outbound keeps the prefix fallback
-    resource.subscribe.assert_called_once()
-    relay = resource.subscribe.call_args.args[0]
-    relay('pubsub', 'sender', 'bus', 'devices/ess/all', {}, b'\x0a\x02\x08\x01')      # ResourceData already encoded it
+    adapter.vip.pubsub.subscribe.assert_called_once()
+    local_topic = adapter.vip.pubsub.subscribe.call_args.kwargs['prefix']
+    assert local_topic == 'openfmb/essmodule/ESSReadingProfile/m1'                  # the remote's delimiter becomes the bus's
+    relay = adapter.vip.pubsub.subscribe.call_args.kwargs['callback']
+    relay('pubsub', 'sender', 'bus', local_topic, {}, {'essReading': {}})
     sent = json.loads(manager.send.call_args.kwargs['message'].payload)
     assert sent == {'topic': 'openfmb.essmodule.ESSReadingProfile.m1', 'payload': '0a020801', 'encoding': 'hex'}
-
 
 def test_publish_remote_envelopes(adapter):
     peer = FakePeer()
@@ -280,82 +282,20 @@ def test_handle_publish_local_decodes_binary_payloads(adapter):
     peer, headers = _remote(adapter, manager)
     resource = mock.MagicMock()
     resource.decode.side_effect = lambda payload: {'decoded': payload.hex()} if isinstance(payload, bytes) else payload
-    resource.transform.execute.side_effect = lambda payload: payload
-    resource.resource_def = {'publication_topic': 'devices/x'}
+    resource.resource_def = {'codec': {'proto': 'essmodule.ESSReadingProfile'}}
     with mock.patch.object(GeventProtocolProxyManager, 'get_by_proxy_id', return_value=(manager, peer)), \
          mock.patch.object(agent_module.ResourceData, 'lookup', return_value=resource):
         raw = json.dumps({'topic': 'a/b/c', 'payload': b'\xff\xfe'.hex()}).encode()      # not UTF-8: stays bytes
         adapter.handle_publish_local(manager, headers, raw)
-    adapter.vip.pubsub.publish.assert_called_with('pubsub', topic='devices/x', message={'decoded': 'fffe'})
+    call = adapter.vip.pubsub.publish.call_args
+    assert call.kwargs['topic'] == 'a/b/c' and call.kwargs['message'] == {'decoded': 'fffe'}
+    assert call.kwargs['headers']['Content-Type'] == 'application/openfmb+json'
 
-
-# ---- translate mode: remote commands for a device go through the Resource Bridge's write RPC -------------------------
-
-def test_handle_publish_local_writes_device_commands_through_the_resource_bridge(adapter):
-    manager = adapter.ppm
-    peer, headers = _remote(adapter, manager)
-    resource = mock.MagicMock()
-    resource.decode.side_effect = lambda payload: payload
-    resource.resource_def = {'publication_topic': 'devices/site1/pv/all', 'rpc_topic': 'devices/site1/pv', 'target_format': 'openfmb.solar.control'}
-    reply = mock.MagicMock()
-    reply.get.return_value = {'target': 'devices/site1/pv', 'path': ['openfmb.solar.control', 'fake_pv'], 'retention': 0.5,
-                              'written': {'704_WMaxLimPct': 50}, 'errors': {}, 'batches': 0, 'failed_batch': None}
-    adapter.vip.rpc.call.return_value = reply
-    with mock.patch.object(GeventProtocolProxyManager, 'get_by_proxy_id', return_value=(manager, peer)), \
-         mock.patch.object(agent_module.ResourceData, 'lookup', return_value=resource):
-        raw = json.dumps({'topic': 'openfmb/solarmodule/SolarControlProfile/m1', 'payload': json.dumps({'solarControl': {}}).encode().hex()}).encode()
-        adapter.handle_publish_local(manager, headers, raw)
-    adapter.vip.rpc.call.assert_called_once_with('platform.resource_bridge', 'write', ['openfmb', 'solarmodule', 'SolarControlProfile', 'm1'],
-                                                 {'solarControl': {}}, 'openfmb.solar.control')
-    resource.transform.execute.assert_not_called()
-    adapter.vip.pubsub.publish.assert_not_called()
-    sent = json.loads(manager.send.call_args.kwargs['message'].payload)
-    assert sent['topic'] == 'openfmb/solarmodule/SolarControlProfile/m1/result' and sent['payload']['written'] == {'704_WMaxLimPct': 50}
-
-
-def test_handle_publish_local_reports_refused_points_and_rpc_failures_to_the_remote(adapter):
-    manager = adapter.ppm
-    peer, headers = _remote(adapter, manager)
-    resource = mock.MagicMock()
-    resource.decode.side_effect = lambda payload: payload
-    resource.resource_def = {'rpc_topic': 'devices/site1/pv', 'target_format': 'f'}
-    reply = mock.MagicMock()
-    reply.get.return_value = {'target': 'devices/site1/pv', 'written': {}, 'errors': {'x': 'read only'}}
-    adapter.vip.rpc.call.return_value = reply
-    with mock.patch.object(GeventProtocolProxyManager, 'get_by_proxy_id', return_value=(manager, peer)), \
-         mock.patch.object(agent_module.ResourceData, 'lookup', return_value=resource):
-        adapter.handle_publish_local(manager, headers, json.dumps({'topic': 'a/b', 'payload': {'x': 1}}).encode())
-    topics = [json.loads(c.kwargs['message'].payload)['topic'] for c in manager.send.call_args_list]
-    assert topics == ['a/b/result', 'a/b/error']
-    manager.send.reset_mock()
-    adapter.vip.rpc.call.side_effect = TimeoutError('no resource bridge')
-    with mock.patch.object(GeventProtocolProxyManager, 'get_by_proxy_id', return_value=(manager, peer)), \
-         mock.patch.object(agent_module.ResourceData, 'lookup', return_value=resource):
-        adapter.handle_publish_local(manager, headers, json.dumps({'topic': 'a/b', 'payload': {'x': 1}}).encode())
-    error = json.loads(manager.send.call_args.kwargs['message'].payload)
-    assert error['topic'] == 'a/b/error' and 'TimeoutError' in error['payload']['errors']['*']
-
-
-def test_inbound_writes_can_be_turned_off(adapter):
-    adapter.config = MessageBusAdapterConfig(bus_type='mqtt', adapters=[{'name': 'r1', 'host': 'h', 'port': 1}], inbound_writes=False)
-    manager = adapter.ppm
-    peer, headers = _remote(adapter, manager)
-    resource = mock.MagicMock()
-    resource.decode.side_effect = lambda payload: payload
-    resource.transform.execute.return_value = {'out': 1}
-    resource.resource_def = {'publication_topic': 'devices/x', 'rpc_topic': 'devices/x'}
-    with mock.patch.object(GeventProtocolProxyManager, 'get_by_proxy_id', return_value=(manager, peer)), \
-         mock.patch.object(agent_module.ResourceData, 'lookup', return_value=resource):
-        adapter.handle_publish_local(manager, headers, json.dumps({'topic': 'a/b', 'payload': {'in': 1}}).encode())
-    adapter.vip.rpc.call.assert_not_called()
-    adapter.vip.pubsub.publish.assert_called_with('pubsub', topic='devices/x', message={'out': 1})
-
-
-# ---- relay mode: OpenFMB on the VOLTTRON bus -------------------------------------------------------------------------
+# ---- OpenFMB on the VOLTTRON bus (relay, the only mode) -------------------------------------------------------------------------
 
 def test_relay_mode_republishes_inbound_messages_on_their_own_topic_with_headers(adapter):
     from interoperability import openfmb_bus
-    adapter.config = MessageBusAdapterConfig(bus_type='mqtt', adapters=[{'name': 'r1', 'host': 'h', 'port': 1}], mode='relay')
+    adapter.config = MessageBusAdapterConfig(bus_type='mqtt', adapters=[{'name': 'r1', 'host': 'h', 'port': 1}])
     adapter.core.identity = 'platform.bus_adapter'
     manager = adapter.ppm
     peer, headers = _remote(adapter, manager)
@@ -377,7 +317,7 @@ def test_relay_mode_republishes_inbound_messages_on_their_own_topic_with_headers
 
 def test_relay_mode_forwards_local_publications_except_its_own(adapter):
     from interoperability import openfmb_bus
-    adapter.config = MessageBusAdapterConfig(bus_type='nats', adapters=[{'name': 'r1', 'servers': 'nats://x:4222'}], mode='relay')
+    adapter.config = MessageBusAdapterConfig(bus_type='nats', adapters=[{'name': 'r1', 'servers': 'nats://x:4222'}])
     adapter.core.identity = 'platform.bus_adapter'
     manager = adapter.ppm
     peer, _ = _remote(adapter, manager)
@@ -403,7 +343,3 @@ def test_relay_mode_forwards_local_publications_except_its_own(adapter):
     manager.send.assert_not_called()
 
 
-def test_mode_is_validated():
-    with pytest.raises(Exception):
-        MessageBusAdapterConfig(bus_type='mqtt', mode='sideways')
-    assert MessageBusAdapterConfig(bus_type='mqtt').mode == 'translate' and MessageBusAdapterConfig(bus_type='mqtt').inbound_writes

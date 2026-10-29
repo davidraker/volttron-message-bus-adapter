@@ -148,21 +148,6 @@ class MessageBusAdapterConfig(BaseModel):
         default_factory=list, description='List of remote bus connections to proxy.')
     proxy_registration_timeout: float = Field(
         default=30.0, gt=0, description='Seconds to wait for a newly launched proxy to register.')
-    mode: Literal['translate', 'relay'] = Field(
-        default='translate',
-        description='How the adapter bridges VOLTTRON and the remote bus. "translate": local device publications are'
-                    ' transformed into the remote topic\'s format here, and a remote message for a device is written'
-                    ' through the Resource Bridge\'s write RPC (see resource_bridge) or, for a remote-owned resource,'
-                    ' published locally in the canonical format. "relay": OpenFMB (or any aliased format) lives on the'
-                    ' VOLTTRON bus itself under the remote topic; the adapter only re-serialises between the remote'
-                    ' encoding and the local JSON form, and the Resource Bridge does the translating.')
-    resource_bridge: str = Field(default='platform.resource_bridge',
-                                description='translate mode: VIP identity of the Resource Bridge that writes devices.')
-    inbound_writes: bool = Field(default=True,
-                                 description='translate mode: write remote messages whose resource has an rpc_topic'
-                                             ' through the Resource Bridge (False: publish them locally as before).')
-    rpc_timeout: float = Field(default=15.0, gt=0, description='Seconds to wait for the Resource Bridge\'s write.')
-
     @model_validator(mode='before')
     @classmethod
     def _build_adapters(cls, data: Any) -> Any:

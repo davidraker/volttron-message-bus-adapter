@@ -15,31 +15,21 @@ transformed before being republished on VOLTTRON, and vice versa.
   `platform.presentation`; install it with its `openfmb` extra (the `protobuf` runtime) in the
   adapter's environment when any alias declares `"encoding": "protobuf"`
 
-## Modes
+## How it meets the platform
 
-`mode` chooses how the adapter meets the rest of the platform:
-
-- `translate` (default): the adapter transforms. A remote topic in `local_subscriptions` is served
-  from the canonical device's publications (`/all` polls and `/multi` pushes), transformed into the
-  remote's format and encoded here. A remote message whose resource is a device (it has an
-  `rpc_topic`) is a command: it is written through the Resource Bridge's `write` RPC
-  (`resource_bridge`, default `platform.resource_bridge`) and the result goes back to the remote on
-  `<topic>/result`, with refused points on `<topic>/error`; `inbound_writes: false` restores the
-  older behaviour of publishing it locally. A remote-owned resource is published locally.
-- `relay`: OpenFMB on the VOLTTRON bus. The remote's topics exist on VOLTTRON's own bus under the
-  same names, carrying the alias format's JSON form with the headers of
-  `interoperability.openfmb_bus`; the adapter only re-serialises. Inbound messages are decoded and
-  republished on their topic (origin: this adapter), local publications on those topics by other
-  agents are encoded and sent out. The Resource Bridge's bus ends, or any OpenFMB-aware agent, do the
-  translating.
+The remote's topics exist on VOLTTRON's own bus under the same names, carrying the alias format's JSON
+form with the headers of `interoperability.openfmb_bus` (OpenFMB on the VOLTTRON bus); the adapter only
+re-serialises. Inbound messages are decoded with the alias registered as exactly their topic and
+republished on that topic (origin: this adapter); local publications on those topics by other agents
+are encoded and sent out. The Resource Bridge's bus ends, or any OpenFMB-aware agent, do the
+translating. (An earlier translate mode, in which the adapter transformed and wrote devices itself,
+was removed on 2026-10-29.)
 
 ## Configuration
 
 ```json
 {
     "bus_type": "mqtt",
-    "mode": "translate",
-    "resource_bridge": "platform.resource_bridge",
     "proxy_registration_timeout": 30,
     "adapters": [
         {"name": "site_broker", "host": "broker.example.org", "port": 1883,
