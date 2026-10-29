@@ -22,15 +22,15 @@ transformed before being republished on VOLTTRON, and vice versa.
 - `translate` (default): the adapter transforms. A remote topic in `local_subscriptions` is served
   from the canonical device's publications (`/all` polls and `/multi` pushes), transformed into the
   remote's format and encoded here. A remote message whose resource is a device (it has an
-  `rpc_topic`) is a command: it is written through the Device Adapter's `write` RPC
-  (`device_adapter`, default `platform.device_adapter`) and the result goes back to the remote on
+  `rpc_topic`) is a command: it is written through the Resource Bridge's `write` RPC
+  (`resource_bridge`, default `platform.resource_bridge`) and the result goes back to the remote on
   `<topic>/result`, with refused points on `<topic>/error`; `inbound_writes: false` restores the
   older behaviour of publishing it locally. A remote-owned resource is published locally.
 - `relay`: OpenFMB on the VOLTTRON bus. The remote's topics exist on VOLTTRON's own bus under the
   same names, carrying the alias format's JSON form with the headers of
   `interoperability.openfmb_bus`; the adapter only re-serialises. Inbound messages are decoded and
   republished on their topic (origin: this adapter), local publications on those topics by other
-  agents are encoded and sent out. The Device Adapter's bus ends, or any OpenFMB-aware agent, do the
+  agents are encoded and sent out. The Resource Bridge's bus ends, or any OpenFMB-aware agent, do the
   translating.
 
 ## Configuration
@@ -39,7 +39,7 @@ transformed before being republished on VOLTTRON, and vice versa.
 {
     "bus_type": "mqtt",
     "mode": "translate",
-    "device_adapter": "platform.device_adapter",
+    "resource_bridge": "platform.resource_bridge",
     "proxy_registration_timeout": 30,
     "adapters": [
         {"name": "site_broker", "host": "broker.example.org", "port": 1883,
@@ -72,6 +72,10 @@ transformed before being republished on VOLTTRON, and vice versa.
 - `remote_subscriptions`: topics the proxy subscribes to on the foreign bus as soon as it is
   up. Messages arriving on them are relayed into VOLTTRON as described below. Equivalent to
   calling the `subscribe` RPC at startup.
+  Each arriving topic is resolved strictly: it must be registered as a resource UAI exactly, with no
+  longest-prefix fallback, so a message on `site1/pv/extra` is dropped rather than treated as `site1/pv`.
+  Entries containing a topic-filter wildcard (`#`, `+`, `*`, `>`) are accepted with a warning: every
+  topic a remote publisher sends under the pattern reaches the adapter. Prefer exact topics.
 - `proxy_registration_timeout`: seconds to wait for a newly launched proxy to register.
 
 A proxy is launched for every configured adapter when the configuration is loaded, and its

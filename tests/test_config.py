@@ -1,3 +1,4 @@
+import logging
 import pytest
 from pydantic import ValidationError
 
@@ -100,3 +101,13 @@ def test_subscription_lists_stay_out_of_proxy_kwargs():
     assert adapter.remote_subscriptions == ['openfmb/essmodule/ESSControlProfile/m1']
     assert adapter.proxy_kwargs() == {'host': 'h', 'port': 1883, 'keepalive': 60, 'bind_address': '', 'bind_port': 0}
     assert MessageBusAdapterConfig(bus_type='mqtt', adapters=[{'host': 'h'}]).adapters[0].local_subscriptions == []
+
+
+def test_wildcard_remote_subscriptions_are_warned_about(caplog):
+    with caplog.at_level(logging.WARNING, logger='bus_adapter.config'):
+        MessageBusAdapterConfig(bus_type='mqtt', adapters=[{'host': 'h', 'remote_subscriptions': ['site1/#', 'site1/pv']}])
+        MessageBusAdapterConfig(bus_type='nats', adapters=[{'servers': 'nats://h:4222', 'remote_subscriptions': ['site1.>', 'a.*.c']}])
+    warned = [r.getMessage() for r in caplog.records if 'wildcard' in r.getMessage()]
+    assert len(warned) == 3
+    assert any('site1/#' in w for w in warned) and any('site1.>' in w for w in warned) and any('a.*.c' in w for w in warned)
+    assert not any('site1/pv' in w for w in warned)

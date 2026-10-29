@@ -32,10 +32,18 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
-from volttron.client import Agent
-from volttron.client.messaging.health import STATUS_BAD, STATUS_GOOD
-from volttron.client.vip.agent import Core, RPC
-from volttron.utils import load_config, vip_main
+from importlib.metadata import distribution, PackageNotFoundError
+try:
+    distribution('volttron-core')
+    from volttron.client import Agent
+    from volttron.client.messaging.health import STATUS_BAD, STATUS_GOOD
+    from volttron.client.vip.agent import Core, RPC
+    from volttron.utils import load_config, vip_main
+except PackageNotFoundError:
+    # The monolithic platform (and der-control-fastlib's compatibility layer) provide the same names here.
+    from volttron.platform.agent.utils import load_config, vip_main
+    from volttron.platform.messaging.health import STATUS_BAD, STATUS_GOOD
+    from volttron.platform.vip.agent import Agent, Core, RPC
 
 from interoperability import openfmb_bus
 from interoperability.resource import ResourceData
@@ -62,7 +70,7 @@ class MessageBusAdapter(Agent):
       remote -> VOLTTRON: the proxy sends PUBLISH_LOCAL; the topic is resolved to a
         canonical resource through platform.presentation and decoded if the alias declares
         a binary encoding. A resource with an ``rpc_topic`` is a device: the message is a
-        command for it and is written through the Device Adapter's ``write`` RPC, the result
+        command for it and is written through the Resource Bridge's ``write`` RPC, the result
         going back to the remote on ``<topic>/result`` (``/error`` when points were refused).
         Otherwise it is remote-owned telemetry: transformed and published locally.
       VOLTTRON -> remote: a remote topic listed in the adapter's ``local_subscriptions``
@@ -73,7 +81,7 @@ class MessageBusAdapter(Agent):
     itself, in the alias format's JSON form with the headers of ``interoperability.openfmb_bus``
     (OpenFMB on the VOLTTRON bus): inbound messages are decoded and republished there, local
     publications on those topics (other than the adapter's own) are encoded and sent out. The
-    Device Adapter, or any OpenFMB-aware agent, does the translating.
+    Resource Bridge, or any OpenFMB-aware agent, does the translating.
     A peer may also call the ``subscribe``/``publish`` RPCs.
     """
 
@@ -86,7 +94,7 @@ class MessageBusAdapter(Agent):
             (self.handle_publish_local, 'PUBLISH_LOCAL'),
             (self.handle_subscribe_local, 'SUBSCRIBE_LOCAL'),
         )
-        self.resources: dict[str, ResourceData] = {}
+        self.resources: dict[tuple[str, bool], ResourceData] = {}    # (remote topic, strict) -> resource
         self._remote_subscriptions: set[tuple[UUID, str]] = set()
         if config_path:
             self.vip.config.set_default('config', load_config(config_path))
@@ -206,10 +214,15 @@ class MessageBusAdapter(Agent):
     # Remote -> Local
     ###################
 
-    def _get_resource_data(self, topic: str, delimiter: str = DEFAULT_TOPIC_DELIMITER) -> ResourceData | None:
-        if not (resource_data := self.resources.get(topic)):
-            if resource_data := ResourceData.lookup(self, topic, delimiter):
-                self.resources[topic] = resource_data
+    def _get_resource_data(self, topic: str, delimiter: str = DEFAULT_TOPIC_DELIMITER, strict: bool = False
+                           ) -> ResourceData | None:
+        """The resource a remote topic stands for. Inbound messages use ``strict``: a message that arrived on topic T
+        is for the resource registered as T exactly, never for a shorter prefix, so a wildcard subscription cannot
+        route a foreign message onto a parent resource."""
+        key = (topic, strict)
+        if not (resource_data := self.resources.get(key)):
+            if resource_data := ResourceData.lookup(self, topic, delimiter, strict=strict):
+                self.resources[key] = resource_data
             else:
                 _log.warning(f'Unable to find Data Resource matching {topic}')
         return resource_data
@@ -243,7 +256,7 @@ class MessageBusAdapter(Agent):
         payload = self._decode_remote_payload(message.get('payload'))
         _log.debug(f'RECEIVED PUBLISH MESSAGE FROM REMOTE: \n\tTOPIC: {topic}\n\tMESSAGE: {payload}')
         delimiter = self._get_delimiter(headers)
-        if not (resource_data := self._get_resource_data(topic, delimiter)):
+        if not (resource_data := self._get_resource_data(topic, delimiter, strict=True)):
             return
         # Binary payloads (protobuf) are decoded by the alias's codec; JSON has already been parsed above.
         decoded = resource_data.decode(payload)
@@ -256,22 +269,22 @@ class MessageBusAdapter(Agent):
                                     headers=openfmb_bus.headers((resource_def.get('codec') or {}).get('proto'), self.identity, remote))
             return
         if self.config.inbound_writes and resource_def.get('rpc_topic'):
-            self._write_through_device_adapter(headers, topic, delimiter, resource_def, decoded)
+            self._write_through_resource_bridge(headers, topic, delimiter, resource_def, decoded)
             return
         transformed_payload = resource_data.transform.execute(decoded)
         local_topic = resource_def.get('publication_topic') or resource_data.local_topic
         self.vip.pubsub.publish('pubsub', topic=local_topic, message=transformed_payload)
 
-    def _write_through_device_adapter(self, headers: ProtocolHeaders, topic: str, delimiter: str, resource_def: dict, message):
-        """A remote message for a device behind the driver: the Device Adapter transforms and writes it; the result
+    def _write_through_resource_bridge(self, headers: ProtocolHeaders, topic: str, delimiter: str, resource_def: dict, message):
+        """A remote message for a device behind the driver: the Resource Bridge transforms and writes it; the result
         (written points, refused points, the chain's path) goes back to the remote on <topic>/result and /error."""
         uai = topic.split(delimiter)
         manager, peer = GeventProtocolProxyManager.get_by_proxy_id(headers.sender_id)
         try:
-            result = self.vip.rpc.call(self.config.device_adapter, 'write', uai, message,
+            result = self.vip.rpc.call(self.config.resource_bridge, 'write', uai, message,
                                        resource_def.get('target_format')).get(timeout=self.config.rpc_timeout)
         except Exception as e:
-            _log.warning(f'Write of {topic} through {self.config.device_adapter} failed: {e!r}')
+            _log.warning(f'Write of {topic} through {self.config.resource_bridge} failed: {e!r}')
             result = {'target': resource_def.get('rpc_topic'), 'written': {}, 'errors': {'*': f'{type(e).__name__}: {e}'}}
         if manager is not None and peer is not None:
             self._publish_remote(manager, peer, f'{topic}{delimiter}result', result)

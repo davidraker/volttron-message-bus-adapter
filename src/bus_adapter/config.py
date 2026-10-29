@@ -24,7 +24,14 @@
 
 from typing import Any, Literal
 
+import logging
+
 from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, field_validator, model_validator
+
+_log = logging.getLogger(__name__)
+
+#: Topic-filter wildcards of the supported buses: MQTT multi- and single-level, NATS single-token and tail.
+WILDCARD_CHARACTERS = ('#', '+', '*', '>')
 
 
 class MessageBusConfig(BaseModel):
@@ -49,6 +56,18 @@ class MessageBusConfig(BaseModel):
         default_factory=list, exclude=True,
         description='Remote topics the proxy subscribes to on the foreign bus as soon as it is up; messages'
                     ' arriving on them are relayed into VOLTTRON (the same as the subscribe RPC).')
+
+    @field_validator('remote_subscriptions')
+    @classmethod
+    def _warn_about_wildcards(cls, value: list[str]) -> list[str]:
+        """A wildcard subscription (MQTT ``#`` or ``+``, NATS ``*`` or ``>``) delivers every matching remote topic.
+        Each arriving topic is still resolved exactly, so unregistered ones are dropped, but the subscription admits
+        anything a remote publisher chooses to send under the pattern; prefer exact topics."""
+        for topic in value:
+            if any(ch in topic for ch in WILDCARD_CHARACTERS):
+                _log.warning(f'remote_subscriptions entry "{topic}" is a wildcard: every topic a remote publishes'
+                             f' under it reaches this adapter. Exact topics are safer.')
+        return value
 
     def unique_remote_id(self, bus_type: str) -> tuple:
         """Identifier used by callers and the ProtocolProxyManager to address this remote."""
@@ -133,16 +152,16 @@ class MessageBusAdapterConfig(BaseModel):
         default='translate',
         description='How the adapter bridges VOLTTRON and the remote bus. "translate": local device publications are'
                     ' transformed into the remote topic\'s format here, and a remote message for a device is written'
-                    ' through the Device Adapter\'s write RPC (see device_adapter) or, for a remote-owned resource,'
+                    ' through the Resource Bridge\'s write RPC (see resource_bridge) or, for a remote-owned resource,'
                     ' published locally in the canonical format. "relay": OpenFMB (or any aliased format) lives on the'
                     ' VOLTTRON bus itself under the remote topic; the adapter only re-serialises between the remote'
-                    ' encoding and the local JSON form, and the Device Adapter does the translating.')
-    device_adapter: str = Field(default='platform.device_adapter',
-                                description='translate mode: VIP identity of the Device Adapter that writes devices.')
+                    ' encoding and the local JSON form, and the Resource Bridge does the translating.')
+    resource_bridge: str = Field(default='platform.resource_bridge',
+                                description='translate mode: VIP identity of the Resource Bridge that writes devices.')
     inbound_writes: bool = Field(default=True,
                                  description='translate mode: write remote messages whose resource has an rpc_topic'
-                                             ' through the Device Adapter (False: publish them locally as before).')
-    rpc_timeout: float = Field(default=15.0, gt=0, description='Seconds to wait for the Device Adapter\'s write.')
+                                             ' through the Resource Bridge (False: publish them locally as before).')
+    rpc_timeout: float = Field(default=15.0, gt=0, description='Seconds to wait for the Resource Bridge\'s write.')
 
     @model_validator(mode='before')
     @classmethod

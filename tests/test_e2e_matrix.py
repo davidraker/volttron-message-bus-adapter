@@ -2,8 +2,8 @@
 
 Runs the interoperability service's ``tests/e2e_matrix/harness.py`` (found next to the installed ``interoperability``
 package, or at ``INTEROPERABILITY_SERVICE_REPO``) with ``E2E_OPENFMB=rpc`` (translate mode: local publications transformed here, inbound controls written through
-the Device Adapter's write RPC with results back to the remote) and ``E2E_OPENFMB=bus`` (relay mode: OpenFMB on the
-VOLTTRON bus, the Device Adapter translating). The service runs in-process and the Modbus, DNP3 and 2030.5
+the Resource Bridge's write RPC with results back to the remote) and ``E2E_OPENFMB=bus`` (relay mode: OpenFMB on the
+VOLTTRON bus, the Resource Bridge translating). The service runs in-process and the Modbus, DNP3 and 2030.5
 interfaces run in both roles through real proxies; VOLTTRON's bus is stubbed. Skipped when the driver stack is not
 importable. About a minute per mode.
 """
@@ -18,7 +18,7 @@ import pytest
 for module in ('volttron.driver.interfaces.modbus.modbus', 'volttron.driver.interfaces.dnp3.dnp3',
                'volttron.driver.interfaces.ieee2030_5.ieee2030_5', 'protocol_proxy.protocol.modbus',
                'protocol_proxy.protocol.dnp3', 'protocol_proxy.protocol.ieee2030_5', 'protocol_proxy.protocol.mqtt',
-               'dnp3.outstation', 'google.protobuf', 'cryptography', 'device_adapter.agent', 'bus_adapter.agent'):
+               'dnp3.outstation', 'google.protobuf', 'cryptography', 'resource_bridge.agent', 'bus_adapter.agent'):
     pytest.importorskip(module)
 interoperability = pytest.importorskip('interoperability')
 
@@ -32,12 +32,12 @@ EXPECTED_PATHS = 24
 def test_matrix(tmp_path, openfmb_mode):
     log = tmp_path / 'e2e.log'
     proc = subprocess.run([sys.executable, str(HARNESS), str(tmp_path / 'work')], capture_output=True, text=True, timeout=1200,
-                          env={**os.environ, 'E2E_LOG': str(log), 'E2E_WRITER': 'device_adapter', 'E2E_OPENFMB': openfmb_mode})
+                          env={**os.environ, 'E2E_LOG': str(log), 'E2E_WRITER': 'resource_bridge', 'E2E_OPENFMB': openfmb_mode})
     report = proc.stdout + proc.stderr
     if proc.returncode != 0 and log.exists():
         report += '\n--- log ---\n' + log.read_text()[-6000:]
     assert proc.returncode == 0, report
-    assert f'writer: device_adapter; openfmb: {openfmb_mode}' in proc.stdout and f'{EXPECTED_PATHS}/{EXPECTED_PATHS} passed' in proc.stdout, report
-    assert proc.stdout.count('[device_adapter/') == 12, report          # every device-to-device path went through a bridge
+    assert f'writer: resource_bridge; openfmb: {openfmb_mode}' in proc.stdout and f'{EXPECTED_PATHS}/{EXPECTED_PATHS} passed' in proc.stdout, report
+    assert proc.stdout.count('[resource_bridge/') == 12, report          # every device-to-device path went through a bridge
     if openfmb_mode == 'rpc':
         assert proc.stdout.count('result to remote on') == 6 and proc.stdout.count('(bus adapter translate)') == 6, report

@@ -117,7 +117,7 @@ def test_handle_publish_local_transforms_and_publishes(adapter):
         raw = json.dumps({'topic': 'a/b/c', 'payload': json.dumps({'in': 1}).encode().hex()}).encode()
         adapter.handle_publish_local(manager, headers, raw)
         adapter.handle_publish_local(manager, headers, raw)    # second call uses the cache
-    lookup.assert_called_once_with(adapter, 'a/b/c', '/')
+    lookup.assert_called_once_with(adapter, 'a/b/c', '/', strict=True)    # inbound: the exact topic, no prefix fallback
     resource.transform.execute.assert_called_with({'in': 1})
     adapter.vip.pubsub.publish.assert_called_with('pubsub', topic='devices/x', message={'out': 1})
 
@@ -259,7 +259,7 @@ def test_subscribe_local_resolves_with_the_proxy_delimiter_and_relays(adapter):
     with mock.patch.object(agent_module.ResourceData, 'lookup', return_value=resource) as lookup:
         adapter._subscribe_local(manager, peer, ['openfmb.essmodule.ESSReadingProfile.m1'])
         adapter._subscribe_local(manager, peer, ['openfmb.essmodule.ESSReadingProfile.m1'])    # already served
-    lookup.assert_called_once_with(adapter, 'openfmb.essmodule.ESSReadingProfile.m1', '.')
+    lookup.assert_called_once_with(adapter, 'openfmb.essmodule.ESSReadingProfile.m1', '.', strict=False)   # outbound keeps the prefix fallback
     resource.subscribe.assert_called_once()
     relay = resource.subscribe.call_args.args[0]
     relay('pubsub', 'sender', 'bus', 'devices/ess/all', {}, b'\x0a\x02\x08\x01')      # ResourceData already encoded it
@@ -289,9 +289,9 @@ def test_handle_publish_local_decodes_binary_payloads(adapter):
     adapter.vip.pubsub.publish.assert_called_with('pubsub', topic='devices/x', message={'decoded': 'fffe'})
 
 
-# ---- translate mode: remote commands for a device go through the Device Adapter's write RPC -------------------------
+# ---- translate mode: remote commands for a device go through the Resource Bridge's write RPC -------------------------
 
-def test_handle_publish_local_writes_device_commands_through_the_device_adapter(adapter):
+def test_handle_publish_local_writes_device_commands_through_the_resource_bridge(adapter):
     manager = adapter.ppm
     peer, headers = _remote(adapter, manager)
     resource = mock.MagicMock()
@@ -305,7 +305,7 @@ def test_handle_publish_local_writes_device_commands_through_the_device_adapter(
          mock.patch.object(agent_module.ResourceData, 'lookup', return_value=resource):
         raw = json.dumps({'topic': 'openfmb/solarmodule/SolarControlProfile/m1', 'payload': json.dumps({'solarControl': {}}).encode().hex()}).encode()
         adapter.handle_publish_local(manager, headers, raw)
-    adapter.vip.rpc.call.assert_called_once_with('platform.device_adapter', 'write', ['openfmb', 'solarmodule', 'SolarControlProfile', 'm1'],
+    adapter.vip.rpc.call.assert_called_once_with('platform.resource_bridge', 'write', ['openfmb', 'solarmodule', 'SolarControlProfile', 'm1'],
                                                  {'solarControl': {}}, 'openfmb.solar.control')
     resource.transform.execute.assert_not_called()
     adapter.vip.pubsub.publish.assert_not_called()
@@ -328,7 +328,7 @@ def test_handle_publish_local_reports_refused_points_and_rpc_failures_to_the_rem
     topics = [json.loads(c.kwargs['message'].payload)['topic'] for c in manager.send.call_args_list]
     assert topics == ['a/b/result', 'a/b/error']
     manager.send.reset_mock()
-    adapter.vip.rpc.call.side_effect = TimeoutError('no device adapter')
+    adapter.vip.rpc.call.side_effect = TimeoutError('no resource bridge')
     with mock.patch.object(GeventProtocolProxyManager, 'get_by_proxy_id', return_value=(manager, peer)), \
          mock.patch.object(agent_module.ResourceData, 'lookup', return_value=resource):
         adapter.handle_publish_local(manager, headers, json.dumps({'topic': 'a/b', 'payload': {'x': 1}}).encode())
@@ -392,8 +392,8 @@ def test_relay_mode_forwards_local_publications_except_its_own(adapter):
     sub = adapter.vip.pubsub.subscribe.call_args.kwargs
     assert sub['prefix'] == 'openfmb/essmodule/ESSReadingProfile/m1'
     relay = sub['callback']
-    relay('pubsub', 'platform.device_adapter', 'bus', 'openfmb/essmodule/ESSReadingProfile/m1',
-          openfmb_bus.headers('essmodule.ESSReadingProfile', 'platform.device_adapter'), {'essReading': {}})
+    relay('pubsub', 'platform.resource_bridge', 'bus', 'openfmb/essmodule/ESSReadingProfile/m1',
+          openfmb_bus.headers('essmodule.ESSReadingProfile', 'platform.resource_bridge'), {'essReading': {}})
     sent = json.loads(manager.send.call_args.kwargs['message'].payload)
     assert sent == {'topic': 'openfmb.essmodule.ESSReadingProfile.m1', 'payload': '0a020801', 'encoding': 'hex'}
     manager.send.reset_mock()
