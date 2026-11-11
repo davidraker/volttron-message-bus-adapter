@@ -8,6 +8,7 @@ version = "2.0.0rc0"
 description = "The VOLTTRON Message Bus Adapter Agent relays data between VOLTTRON and a foreign message bus."
 authors = [{name = "The VOLTTRON Development Team", email = "volttron@pnnl.gov"}]
 license = "Apache-2.0"
+license-files = ["LICENSE", "COPYRIGHT.md"]
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
 classifiers = [

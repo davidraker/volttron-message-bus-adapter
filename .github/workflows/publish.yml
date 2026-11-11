@@ -1,0 +1,56 @@
+name: Publish to PyPI
+
+# Publishes the distribution to PyPI when a version tag is pushed.
+# Tag format: v<version>, where <version> matches [project].version in
+# pyproject.toml (for example v0.2.0). Publication uses PyPI trusted
+# publishing: register this repository, this workflow file and the "pypi"
+# environment as a publisher of the project on pypi.org; no token is stored.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Poetry
+        run: pipx install poetry
+      - name: Check that the tag matches the project version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          project_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [ "$tag_version" != "$project_version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match pyproject.toml version $project_version" >&2
+            exit 1
+          fi
+      - name: Build sdist and wheel
+        run: poetry build
+      - name: Check distribution metadata
+        run: pipx run twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/volttron-message-bus-adapter/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
