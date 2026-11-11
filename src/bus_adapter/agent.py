@@ -210,8 +210,17 @@ class MessageBusAdapter(Agent):
         presentation service reaches a running adapter. A resource that no longer resolves leaves the cache; the next
         message on its topic looks it up afresh. Relays hold the resource objects, so a successful reload reaches them."""
         for key, resource in list(self.resources.items()):
+            definition = self.config.definitions.get(key[0])
             try:
-                ok = resource.reload()
+                if resource.origin == 'local' and definition is None:
+                    ok = False                              # the local definition was removed: resolve afresh next time
+                elif definition is not None:
+                    if resource.origin != 'local':          # a definition now covers a topic the service used to resolve
+                        self.resources[key] = ResourceData.from_definition(self, key[0], definition)
+                        continue
+                    ok = resource.reload(definition)
+                else:
+                    ok = resource.reload()
             except Exception as e:                      # the service may be down mid-reconfiguration
                 ok = False
                 _log.warning(f'Could not refresh resource {key[0]}: {e!r}')
@@ -230,7 +239,11 @@ class MessageBusAdapter(Agent):
         route a foreign message onto a parent resource."""
         key = (topic, strict)
         if not (resource_data := self.resources.get(key)):
-            if resource_data := ResourceData.lookup(self, topic, delimiter, strict=strict):
+            if (definition := self.config.definitions.get(topic)) is not None:
+                resource_data = ResourceData.from_definition(self, topic, definition)     # declared here: no service call
+            else:
+                resource_data = ResourceData.lookup(self, topic, delimiter, strict=strict)
+            if resource_data:
                 self.resources[key] = resource_data
             else:
                 _log.warning(f'Unable to find Data Resource matching {topic}')
@@ -344,6 +357,13 @@ class MessageBusAdapter(Agent):
     ###################
     # RPC Interface
     ###################
+
+    @RPC.export
+    def local_definitions(self) -> dict:
+        """The resources this adapter declares itself rather than resolving through the presentation service, by remote
+        topic, as configured. A configuration UI that reads the store sees only the service's resources; this is how it
+        learns about an agent's own."""
+        return {topic: d.model_dump(mode='json') for topic, d in self.config.definitions.items()}
 
     @RPC.export
     def list_remotes(self) -> list[list]:

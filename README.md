@@ -73,6 +73,21 @@ subscriptions are applied once it has registered. Reloading the configuration re
 them; topics already served are skipped, and removing a topic does not stop it until the
 agent restarts. Changing `bus_type` at runtime is not supported; restart the agent instead.
 
+### Topics declared locally
+
+`definitions` maps a remote topic to a resource declared here instead of resolved through the presentation service,
+in the form of `icm.resources.definitions`: usually an alias giving the format, codec and `transform` stage list the
+remote topic carries for the canonical device it presents. The service is not consulted for these topics, and a
+configuration update re-reads them (and re-resolves every other cached topic).
+
+```json
+{"bus_type": "mqtt", "adapters": [{"host": "broker", "port": 1883}],
+ "definitions": {"site/pv/reading": {"kind": "alias", "uai": ["site", "pv", "reading"], "data_format": "fake_pv",
+                                     "target_format": "openfmb.solar.reading", "publication_topic": "devices/site/pv/all",
+                                     "codec": {"encoding": "protobuf", "proto": "solarmodule.SolarReadingProfile"},
+                                     "transform": [{"#": "transform(device_values())", "...": "..."}]}}}
+```
+
 ## Payload encoding
 
 Payloads cross the adapter-to-proxy link in a JSON envelope, `{"topic": ..., "payload": ...}`.
@@ -93,6 +108,9 @@ turns them back into the dict the transform reads.
 | `publish(unique_remote_id, topic, payload)` | id, str, JSON-serializable | Publish to the foreign bus. |
 
 Only remotes present in `adapters` can be addressed.
+
+- `local_definitions()`: the resources this adapter declares itself, by remote topic, so a configuration tool can
+  show them beside the service's resources.
 
 ## Development
 

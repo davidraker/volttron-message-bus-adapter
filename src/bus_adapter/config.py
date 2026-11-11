@@ -28,6 +28,8 @@ import logging
 
 from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, field_validator, model_validator
 
+from icm.resources.definitions import LocalAlias, LocalCanonical, parse_definition
+
 _log = logging.getLogger(__name__)
 
 #: Topic-filter wildcards of the supported buses: MQTT multi- and single-level, NATS single-token and tail.
@@ -148,6 +150,16 @@ class MessageBusAdapterConfig(BaseModel):
         default_factory=list, description='List of remote bus connections to proxy.')
     proxy_registration_timeout: float = Field(
         default=30.0, gt=0, description='Seconds to wait for a newly launched proxy to register.')
+    definitions: dict[str, LocalCanonical | LocalAlias] = Field(
+        default_factory=dict, description='Resources declared here instead of resolved through the presentation service,'
+                                          ' by remote topic: an alias gives the format, codec and chain a remote topic'
+                                          ' carries for the canonical device it presents. The presentation service is'
+                                          ' not consulted for these topics.')
+
+    @field_validator('definitions', mode='before')
+    @classmethod
+    def _parse_definitions(cls, value):
+        return {topic: parse_definition(d) if isinstance(d, dict) else d for topic, d in (value or {}).items()}
     @model_validator(mode='before')
     @classmethod
     def _build_adapters(cls, data: Any) -> Any:
