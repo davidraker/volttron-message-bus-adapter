@@ -2,6 +2,38 @@
 requires = ["poetry-core>=2.0.0"]
 build-backend = "poetry.core.masonry.api"
 
+[project]
+name = "volttron-message-bus-adapter"
+version = "2.0.0rc0"
+description = "The VOLTTRON Message Bus Adapter Agent relays data between VOLTTRON and a foreign message bus."
+authors = [{name = "The VOLTTRON Development Team", email = "volttron@pnnl.gov"}]
+license = "Apache-2.0"
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Developers",
+]
+dependencies = [
+    "volttron-core>=2.0.0rc30",
+    "protocol-proxy>=2.0.0rc2",
+    "pydantic>=2.0,<3.0",
+    "icm-lib-transforms>=0.1.0",
+    "icm-lib-resources[volttron]>=0.1.0",
+]
+
+[project.scripts]
+volttron-message-bus-adapter = "bus_adapter.agent:main"
+
+[project.urls]
+Repository = "https://github.com/interoperability-control-modules/message-bus-adapter"
+Homepage = "https://github.com/interoperability-control-modules/message-bus-adapter"
+
+[tool.poetry]
+packages = [{ include = "bus_adapter", from = "src" }]
+
 [tool.isort]
 profile = "black"
 
@@ -14,38 +46,6 @@ warn_return_any = true
 warn_unused_configs = true
 show_error_codes = true
 exclude = ['docs/']
-
-[[tool.mypy.overrides]]
-module = ["gevent.*", "mock.*", "pytest.*", "pytz.*", "volttron.*", "protocol_proxy.*", "interoperability.*"]
-ignore_missing_imports = true
-
-[tool.poetry]
-name = "volttron-message-bus-adapter"
-version = "2.0.0rc0"
-description = "The VOLTTRON Message Bus Adapter Agent relays data between VOLTTRON and a foreign message bus."
-authors = ["The VOLTTRON Development Team <volttron@pnnl.gov>"]
-license = "Apache License 2.0"
-readme = "README.md"
-repository = "https://github.com/eclipse-volttron/volttron-message-bus-adapter"
-homepage = "https://github.com/eclipse-volttron/volttron-message-bus-adapter"
-keywords = []
-packages = [ { include = "bus_adapter", from = "src" } ]
-classifiers = [
-    "Programming Language :: Python :: 3 :: Only",
-    "Intended Audience :: Science/Research",
-    "Intended Audience :: Information Technology",
-    "Intended Audience :: Developers",
-    "Intended Audience :: Other Audience",
-    "License :: OSI Approved :: Apache Software License"
-]
-
-[tool.poetry.dependencies]
-python = ">=3.10,<4.0"
-volttron-core = ">=2.0.0rc30"
-protocol-proxy = ">=2.0.0rc2"
-pydantic = "^2.0"
-# TODO: interoperability-service (provides interoperability.resource) is not yet published.
-#  It must be installed alongside this agent, e.g. from ../interoperability_service.
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"
@@ -60,9 +60,6 @@ isort = "^5.10.1"
 [tool.poetry.group.documentation.dependencies]
 Sphinx = "^4.5.0"
 sphinx-rtd-theme = "^1.0.0"
-
-[tool.poetry.scripts]
-volttron-message-bus-adapter = "bus_adapter.agent:main"
 
 [tool.yapf]
 based_on_style = "pep8"

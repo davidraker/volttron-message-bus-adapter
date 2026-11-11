@@ -11,14 +11,14 @@ transformed before being republished on VOLTTRON, and vice versa.
 - `volttron-core` >= 2.0.0rc30
 - `protocol-proxy` >= 2.0.0rc1 plus the plugin for the bus type
   (`protocol_proxy.protocol.mqtt` or `protocol_proxy.protocol.nats`)
-- `interoperability-service` (provides `interoperability.resource`) running as
-  `platform.presentation`; install it with its `openfmb` extra (the `protobuf` runtime) in the
-  adapter's environment when any alias declares `"encoding": "protobuf"`
+- the interoperability service running as `platform.presentation`
+- `icm-lib-resources` with its `openfmb` extra (the `protobuf` runtime) when any alias declares
+  `"encoding": "protobuf"`
 
 ## How it meets the platform
 
 The remote's topics exist on VOLTTRON's own bus under the same names, carrying the alias format's JSON
-form with the headers of `interoperability.openfmb_bus` (OpenFMB on the VOLTTRON bus); the adapter only
+form with the headers of `icm.resources.openfmb.bus` (OpenFMB on the VOLTTRON bus); the adapter only
 re-serialises. Inbound messages are decoded with the alias registered as exactly their topic and
 republished on that topic (origin: this adapter); local publications on those topics by other agents
 are encoded and sent out. The Resource Bridge's bus ends, or any OpenFMB-aware agent, do the
@@ -77,7 +77,7 @@ agent restarts. Changing `bus_type` at runtime is not supported; restart the age
 
 Payloads cross the adapter-to-proxy link in a JSON envelope, `{"topic": ..., "payload": ...}`.
 JSON-serializable payloads travel as they are and are published as UTF-8 JSON text. When the
-alias for a topic declares `"encoding": "protobuf"`, `interoperability.resource.ResourceData`
+alias for a topic declares `"encoding": "protobuf"`, `icm.resources.resource.ResourceData`
 encodes the transformed message with the format's protobuf class and hands the adapter
 `bytes`; the adapter hex-encodes them and adds `"encoding": "hex"`, and the proxy publishes
 the raw bytes. Inbound binary payloads take the same route in reverse: the proxy forwards

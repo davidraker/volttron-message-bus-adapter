@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 
-from interoperability import openfmb_bus
+from icm.resources.openfmb import bus as openfmb_bus
 
 from bus_adapter import agent as agent_module
 from bus_adapter.agent import MessageBusAdapter
@@ -294,7 +294,7 @@ def test_handle_publish_local_decodes_binary_payloads(adapter):
 # ---- OpenFMB on the VOLTTRON bus (relay, the only mode) -------------------------------------------------------------------------
 
 def test_relay_mode_republishes_inbound_messages_on_their_own_topic_with_headers(adapter):
-    from interoperability import openfmb_bus
+    from icm.resources.openfmb import bus as openfmb_bus
     adapter.config = MessageBusAdapterConfig(bus_type='mqtt', adapters=[{'name': 'r1', 'host': 'h', 'port': 1}])
     adapter.core.identity = 'platform.bus_adapter'
     manager = adapter.ppm
@@ -316,7 +316,7 @@ def test_relay_mode_republishes_inbound_messages_on_their_own_topic_with_headers
 
 
 def test_relay_mode_forwards_local_publications_except_its_own(adapter):
-    from interoperability import openfmb_bus
+    from icm.resources.openfmb import bus as openfmb_bus
     adapter.config = MessageBusAdapterConfig(bus_type='nats', adapters=[{'name': 'r1', 'servers': 'nats://x:4222'}])
     adapter.core.identity = 'platform.bus_adapter'
     manager = adapter.ppm
@@ -343,3 +343,12 @@ def test_relay_mode_forwards_local_publications_except_its_own(adapter):
     manager.send.assert_not_called()
 
 
+def test_update_reconfiguration_refreshes_cached_resources(adapter):
+    """A configuration update re-resolves every cached resource and drops the ones that no longer resolve."""
+    from unittest import mock
+    keep, gone = mock.MagicMock(), mock.MagicMock()
+    keep.reload.return_value, gone.reload.return_value = True, False
+    adapter.resources = {('site/a', False): keep, ('site/b', False): gone}
+    adapter.configure_main(None, 'UPDATE', {'bus_type': adapter.config.bus_type or 'mqtt', 'adapters': []})
+    keep.reload.assert_called_once(); gone.reload.assert_called_once()
+    assert list(adapter.resources) == [('site/a', False)]
