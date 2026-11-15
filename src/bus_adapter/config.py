@@ -87,19 +87,19 @@ class MessageBusConfig(BaseModel):
 
 class MQTTConfig(MessageBusConfig):
     """Parameters of protocol_proxy.protocol.mqtt.MQTTProxy. Unset optional values are not sent."""
-    host: str
-    port: int = 1883
-    keepalive: int = 60
-    bind_address: str = ''
-    bind_port: int = 0
-    client_id: str | None = None
-    username: str | None = None
-    password: str | None = None
-    tls: bool | None = None
-    protocol: Literal['MQTTv31', 'MQTTv311', 'MQTTv5'] | None = None
-    qos: Literal[0, 1, 2] | None = None
-    reconnect_min_delay: float | None = Field(default=None, gt=0)
-    reconnect_max_delay: float | None = Field(default=None, gt=0)
+    host: str = Field(description='The broker\'s host name or address.', json_schema_extra={'group': 'Broker', 'order': 10})
+    port: int = Field(default=1883, description='The broker\'s TCP port (1883; 8883 with TLS).', json_schema_extra={'group': 'Broker', 'order': 20})
+    username: str | None = Field(default=None, description='Broker user, when the broker requires one.', json_schema_extra={'group': 'Broker', 'order': 30})
+    password: str | None = Field(default=None, description='Broker password.', json_schema_extra={'group': 'Broker', 'order': 40})
+    tls: bool | None = Field(default=None, description='Connect with TLS.', json_schema_extra={'group': 'Broker', 'order': 50})
+    keepalive: int = Field(default=60, description='Seconds between keep-alive pings.', json_schema_extra={'group': 'Session', 'advanced': True, 'unit': 's'})
+    client_id: str | None = Field(default=None, description='MQTT client id; the broker assigns one when empty.', json_schema_extra={'group': 'Session', 'advanced': True})
+    protocol: Literal['MQTTv31', 'MQTTv311', 'MQTTv5'] | None = Field(default=None, description='MQTT protocol version.', json_schema_extra={'group': 'Session', 'advanced': True})
+    qos: Literal[0, 1, 2] | None = Field(default=None, description='Quality of service for publishes and subscriptions.', json_schema_extra={'group': 'Session', 'advanced': True})
+    bind_address: str = Field(default='', description='Local interface to connect from.', json_schema_extra={'group': 'Session', 'advanced': True})
+    bind_port: int = Field(default=0, description='Local port to connect from; 0 lets the system choose.', json_schema_extra={'group': 'Session', 'advanced': True})
+    reconnect_min_delay: float | None = Field(default=None, gt=0, description='Shortest wait before reconnecting.', json_schema_extra={'group': 'Session', 'advanced': True, 'unit': 's'})
+    reconnect_max_delay: float | None = Field(default=None, gt=0, description='Longest wait before reconnecting.', json_schema_extra={'group': 'Session', 'advanced': True, 'unit': 's'})
 
     def _identity(self) -> tuple:
         return self.host, self.port
@@ -110,15 +110,15 @@ class NATSConfig(MessageBusConfig):
 
     ``servers`` is one URL or a list of URLs; it is sent to the proxy as a comma-separated string.
     """
-    servers: str | list[str]
-    name: str | None = None
-    user: str | None = None
-    password: str | None = None
-    nats_token: str | None = None
-    connect_timeout: float | None = Field(default=None, gt=0)
-    max_reconnect_attempts: int | None = None
-    reconnect_time_wait: float | None = Field(default=None, gt=0)
-    tls: bool | None = None
+    servers: str | list[str] = Field(description='Server URL, or several separated by commas (nats://host:4222).', json_schema_extra={'group': 'Servers', 'order': 10})
+    name: str | None = Field(default=None, description='Connection name shown to the server.', json_schema_extra={'group': 'Servers', 'order': 20})
+    user: str | None = Field(default=None, description='Server user, when the server requires one.', json_schema_extra={'group': 'Servers', 'order': 30})
+    password: str | None = Field(default=None, description='Server password.', json_schema_extra={'group': 'Servers', 'order': 40})
+    nats_token: str | None = Field(default=None, description='Authentication token, instead of user and password.', json_schema_extra={'group': 'Servers', 'order': 50})
+    tls: bool | None = Field(default=None, description='Connect with TLS.', json_schema_extra={'group': 'Servers', 'order': 60})
+    connect_timeout: float | None = Field(default=None, gt=0, description='Seconds to wait for the connection.', json_schema_extra={'group': 'Session', 'advanced': True, 'unit': 's'})
+    max_reconnect_attempts: int | None = Field(default=None, description='Reconnect attempts before giving up; unset: forever.', json_schema_extra={'group': 'Session', 'advanced': True})
+    reconnect_time_wait: float | None = Field(default=None, gt=0, description='Seconds between reconnect attempts.', json_schema_extra={'group': 'Session', 'advanced': True, 'unit': 's'})
 
     @field_validator('servers')
     @classmethod
