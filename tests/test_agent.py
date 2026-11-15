@@ -377,3 +377,20 @@ def test_reconfiguration_re_reads_or_removes_local_definitions(adapter):
     assert adapter.resources[('site/pv/remote', False)] is kept and kept.transform.execute([{'W': 2500}, {}]) == {'kW': 25.0}
     assert ('site/gone', False) not in adapter.resources
 
+
+
+def test_a_message_the_codec_refuses_is_reported_and_skipped(adapter, caplog):
+    """An encode failure must not escape the pubsub callback as a traceback per message; it is one warning naming the
+    topics and the reason, and the next message is tried."""
+    import json, logging
+    from unittest.mock import MagicMock
+    resource = MagicMock(); resource.encode.side_effect = ValueError('Expected true or false without quotes at X.Y')
+    adapter._get_resource_data = lambda topic, delimiter: resource
+    adapter._delimiter_for = lambda manager: '/'
+    manager, peer = MagicMock(), MagicMock(); peer.proxy_id = 'p1'
+    adapter._subscribe_local(manager, peer, ['remote/topic'])
+    relay = adapter.vip.pubsub.subscribe.call_args.kwargs['callback']
+    with caplog.at_level(logging.WARNING):
+        relay('pubsub', 'sender', 'bus', 'remote/topic', {}, {'bad': 'value'})
+    assert any('could not be encoded' in r.message and 'Expected true or false' in r.message for r in caplog.records)
+    assert not manager.send.called if hasattr(manager, 'send') else True

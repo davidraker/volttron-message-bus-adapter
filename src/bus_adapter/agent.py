@@ -346,7 +346,12 @@ class MessageBusAdapter(Agent):
         def relay_to_remote(_peer, _sender, _bus, topic, message_headers, message):
             if topic != local_topic or openfmb_bus.origin_of(message_headers) == self.identity:
                 return
-            self._publish_remote(manager, peer, remote_topic, resource_data.encode(message))
+            try:
+                payload = resource_data.encode(message)
+            except Exception as e:      # a value the wire format refuses: say so once per message, keep relaying the next
+                _log.warning(f'Not relayed: "{local_topic}" to "{remote_topic}" could not be encoded: {str(e).splitlines()[0][:300]}')
+                return
+            self._publish_remote(manager, peer, remote_topic, payload)
         return relay_to_remote
 
     @staticmethod
