@@ -77,6 +77,12 @@ class MessageBusAdapter(Agent):
     or an OpenFMB-aware agent; the adapter only re-serialises.
     A peer may also call the ``subscribe``/``publish`` RPCs.
     """
+    @Core.receiver('onstart')
+    def _start_heartbeat(self, sender, **kwargs):
+        # The platform's health service learns of an agent from its heartbeats; without them the status this agent
+        # sets never reaches the health listing (nor the configuration UI).
+        self.vip.heartbeat.start()
+
 
     def __init__(self, config_path: str | None = None, **kwargs):
         super().__init__(**kwargs)
