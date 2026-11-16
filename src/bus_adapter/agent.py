@@ -124,6 +124,7 @@ class MessageBusAdapter(Agent):
                                     ' is not supported. Restart the agent. Keeping the existing configuration.')
             return
         self.config = new_config
+        self._generation = getattr(self, '_generation', 0) + 1     # retries of an earlier configuration stop here
         if action == 'UPDATE':
             self._refresh_resources()
         if not self.config.bus_type:
@@ -322,11 +323,12 @@ class MessageBusAdapter(Agent):
             return
         self._subscribe_local(manager, peer, topics)
 
-    def _subscribe_local(self, manager: GeventProtocolProxyManager, peer: ProtocolProxyPeer, topics: list[str]):
+    def _subscribe_local(self, manager: GeventProtocolProxyManager, peer: ProtocolProxyPeer, topics: list[str], attempt: int = 0):
         """Serve remote topics from local data: resolve each through platform.presentation, subscribe to the
         canonical resource's publications and relay them, transformed and encoded, to the peer. Topics already
         served to this peer are skipped, so repeated requests and configuration reloads are harmless."""
         delimiter = self._delimiter_for(manager)
+        unresolved = []
         for topic in topics:
             key = (peer.proxy_id, topic)
             if key in self._remote_subscriptions:
@@ -338,6 +340,26 @@ class MessageBusAdapter(Agent):
                                           callback=self._make_bus_relay(manager, peer, topic, local_topic, resource_data))
                 _log.info(f'Relaying local publications on "{local_topic}" to remote topic "{topic}"')
                 self._remote_subscriptions.add(key)
+            else:
+                unresolved.append(topic)
+        if unresolved:
+            self._retry_subscribe_local(manager, peer, unresolved, attempt)
+
+    #: Seconds between attempts to serve a remote topic whose resource the presentation service did not know yet: the
+    #: service comes up beside this agent at platform start, and an alias is often declared after the adapter learned
+    #: its topics.
+    RETRY_DELAYS = (5, 10, 20, 40, 60)
+
+    def _retry_subscribe_local(self, manager, peer, topics: list[str], attempt: int):
+        delay = self.RETRY_DELAYS[min(attempt, len(self.RETRY_DELAYS) - 1)]
+        level = _log.warning if attempt == 0 or attempt % 5 == 0 else _log.debug
+        level(f'No resource yet for remote topic(s) {", ".join(topics)}; trying again in {delay} s (attempt {attempt + 1}).')
+        generation = getattr(self, '_generation', 0)
+
+        def retry():
+            if getattr(self, '_generation', 0) == generation and self.ppm is manager:
+                self._subscribe_local(manager, peer, topics, attempt + 1)
+        self.core.spawn_later(delay, retry)
 
     def _make_bus_relay(self, manager: GeventProtocolProxyManager, peer: ProtocolProxyPeer, remote_topic: str, local_topic: str,
                         resource_data: ResourceData) -> Callable:

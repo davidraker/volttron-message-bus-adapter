@@ -394,3 +394,23 @@ def test_a_message_the_codec_refuses_is_reported_and_skipped(adapter, caplog):
         relay('pubsub', 'sender', 'bus', 'remote/topic', {}, {'bad': 'value'})
     assert any('could not be encoded' in r.message and 'Expected true or false' in r.message for r in caplog.records)
     assert not manager.send.called if hasattr(manager, 'send') else True
+
+
+def test_a_remote_topic_without_a_resource_yet_is_tried_again(adapter):
+    """At platform start the presentation service may not know an alias yet (or not answer). The topic is tried again
+    with a growing delay instead of being dropped until the next reconfiguration."""
+    from unittest.mock import MagicMock
+    answers = {'n': 0}
+    def lookup(topic, delimiter, strict=False):
+        answers['n'] += 1
+        return None if answers['n'] < 3 else MagicMock()
+    adapter._get_resource_data = lookup
+    adapter._delimiter_for = lambda manager: '/'
+    manager, peer = adapter.ppm, MagicMock(); peer.proxy_id = 'p1'
+    adapter._subscribe_local(manager, peer, ['openfmb/x/y/z'])
+    assert not adapter.vip.pubsub.subscribe.called
+    assert adapter.core.spawn_later.call_count == 1 and adapter.core.spawn_later.call_args.args[0] == 5
+    adapter.core.spawn_later.call_args.args[1]()          # still unknown: scheduled again, later
+    assert not adapter.vip.pubsub.subscribe.called and adapter.core.spawn_later.call_args.args[0] == 10
+    adapter.core.spawn_later.call_args.args[1]()          # now known: subscribed
+    assert adapter.vip.pubsub.subscribe.called and (peer.proxy_id, 'openfmb/x/y/z') in adapter._remote_subscriptions
